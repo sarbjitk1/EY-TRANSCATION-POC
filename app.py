@@ -19,8 +19,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.explain import fallback_explanation, feature_contributions, predict_frame, run_agent
-from src.pipeline import (COLUMN_DESCRIPTIONS, INPUT_COLS, LABEL_COL, NUMERIC_FEATURES, coerce_schema,
-                          engineer_features, id_shape, normalize_label, parse_amount)
+from src.pipeline import (COLUMN_DESCRIPTIONS, INPUT_COLS, LABEL_COL, MODEL_NUMERIC_FEATURES,
+                          coerce_schema, engineer_features, id_shape, normalize_label, parse_amount)
 
 ROOT = Path(__file__).parent
 st.set_page_config(page_title="Transaction Classifier", page_icon="📊", layout="wide")
@@ -194,30 +194,22 @@ with tab1:
             st.metric("Label purity", f"{(purity['purity'] * purity['n']).sum() / purity['n'].sum():.1%}",
                       help="How often the most common class for a value is the right answer.")
 
-        st.subheader("Outliers & correlations")
-        c1, c2 = st.columns(2)
-        with c1:
-            la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
-            q1, q3 = la.quantile([.25, .75])
-            lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
-            fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
-            fig.update_traces(marker_color=PRIMARY)
-            for x in (lo, hi):
-                fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
-            fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
-                             ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
-            st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
-                            width="stretch")
-            m = st.columns(3)
-            m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
-            m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
-            m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
-        with c2:
-            corr = eng_all[NUMERIC_FEATURES].assign(
-                **{f"is_{c}": (raw["label"] == c).astype(float) for c in ["Category_1", "Category_2"]}).corr()
-            fig = px.imshow(corr, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto",
-                            title="Correlation - numeric features vs top classes")
-            st.plotly_chart(style(fig, 470), width="stretch")
+        st.subheader("Outliers")
+        la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
+        q1, q3 = la.quantile([.25, .75])
+        lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+        fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
+        fig.update_traces(marker_color=PRIMARY)
+        for x in (lo, hi):
+            fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
+        fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
+                         ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
+        st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
+                        width="stretch")
+        m = st.columns(3)
+        m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
+        m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
+        m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
 
     # ------------------------------------------------------------------ Cleaning & preprocessing
     with prep:
@@ -295,11 +287,6 @@ with tab1:
                                        **{c: eng_all.loc[ex.index, c] for c in
                                           ["month", "day", "is_month_start", "is_month_end"]}}),
                          hide_index=True, width="stretch")
-            by_m = eng_all["month"].value_counts().sort_index().reset_index()
-            by_m.columns = ["month", "rows"]
-            fig = px.bar(by_m, x="month", y="rows", text="rows", title="After: rows per posting month")
-            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
-            st.plotly_chart(style(fig, 320).update_xaxes(dtick=1), width="stretch")
 
         elif step == "Reference ID":
             k = st.columns(2)
@@ -339,10 +326,10 @@ with tab1:
 
         elif step == "Scaling":
             num = encoder.named_transformers_["numeric"]
-            feat = st.selectbox("Numeric feature", NUMERIC_FEATURES)
-            imputed = num.named_steps["impute"].transform(eng_all[NUMERIC_FEATURES])
-            scaled = pd.DataFrame(num.named_steps["scale"].transform(imputed), columns=NUMERIC_FEATURES)
-            before = pd.Series(imputed[:, NUMERIC_FEATURES.index(feat)])
+            feat = st.selectbox("Numeric feature", MODEL_NUMERIC_FEATURES)
+            imputed = num.named_steps["impute"].transform(eng_all[MODEL_NUMERIC_FEATURES])
+            scaled = pd.DataFrame(num.named_steps["scale"].transform(imputed), columns=MODEL_NUMERIC_FEATURES)
+            before = pd.Series(imputed[:, MODEL_NUMERIC_FEATURES.index(feat)])
             c1, c2 = st.columns(2)
             for col, s, name, color in [(c1, before, "Before", BEFORE), (c2, scaled[feat], "After", PRIMARY)]:
                 fig = px.histogram(s, nbins=50, title=f"{name}: {feat}")

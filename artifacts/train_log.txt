@@ -1,10 +1,9 @@
 rows 5899 -> 5220 after removing exact duplicates
-Logistic Regression      acc 0.9474  macroF1 0.7434  (2.6s)
-Random Forest            acc 0.9479  macroF1 0.6599  (4.1s)
-Hist Gradient Boosting   acc 0.9440  macroF1 0.6669  (50.4s)
-Soft-Voting Ensemble     acc 0.9510  macroF1 0.7123  (51.8s)
+Logistic Regression      acc 0.9464  macroF1 0.7838  (2.2s)
+Random Forest            acc 0.9496  macroF1 0.6655  (3.4s)
+Hist Gradient Boosting   acc 0.9347  macroF1 0.6031  (40.0s)
+Soft-Voting Ensemble     acc 0.9487  macroF1 0.6455  (41.2s)
 best family: Logistic Regression
 best params: {'clf__C': 10}
-HOLD-OUT  acc 0.9636  macroF1 0.8971
-done in 112.9s
-.venv/bin/python -u train.py  451.46s user 96.56s system 475% cpu 1:55.17 total
+HOLD-OUT  acc 0.9636  macroF1 0.8976
+done in 90.9s

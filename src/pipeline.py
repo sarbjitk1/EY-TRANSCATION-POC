@@ -36,6 +36,13 @@ NUMERIC_FEATURES = [
     "col1_ntok", "col4_ntok", "col6_ntok", "col4_missing",
 ]
 
+# Col2 (reference ID) and Col5 (posting date) are still engineered above for the
+# EDA charts, but the model ignores them: dropping them left CV scores unchanged.
+DROPPED_COLS = ["Col2", "Col5"]
+MODEL_CATEGORICAL = ["col7"]
+MODEL_NUMERIC_FEATURES = [f for f in NUMERIC_FEATURES
+                          if not f.startswith("col2_") and f not in ("month", "day", "is_month_start", "is_month_end")]
+
 
 # --------------------------------------------------------------------------- #
 # Label cleaning
@@ -182,9 +189,9 @@ def build_preprocessor(ngram_max: int = 2, max_features: int | None = None) -> P
             ("col4_tfidf", _tfidf(ngram_max, max_features), "Col4_text"),
             ("col6_tfidf", _tfidf(ngram_max, max_features), "Col6_text"),
             ("categorical", OneHotEncoder(handle_unknown="ignore", min_frequency=2),
-             ["col2_shape", "col7"]),
+             MODEL_CATEGORICAL),
             ("numeric", Pipeline([("impute", SimpleImputer(strategy="median")),
-                                  ("scale", StandardScaler())]), NUMERIC_FEATURES),
+                                  ("scale", StandardScaler())]), MODEL_NUMERIC_FEATURES),
         ],
         sparse_threshold=1.0,
     )
