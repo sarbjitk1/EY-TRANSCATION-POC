@@ -30,6 +30,18 @@ CLASS_COLORS = {"Category_1": "#2a78d6", "Category_2": "#eb6834", "Category_3": 
                 "Category_4": "#eda100", "Category_5": "#e87ba4", "Category_6": "#008300"}
 CLASS_ORDER = list(CLASS_COLORS)
 SEQ = "Blues"
+PRIMARY, BEFORE = CLASS_COLORS["Category_1"], "#b8bec6"
+
+
+def rgba(hex_color, alpha):
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+
+def get_encoder(model):
+    """Fitted ColumnTransformer from the model (or the first member of an ensemble)."""
+    pipe = model if hasattr(model, "named_steps") else model.estimators_[0]
+    return pipe.named_steps["prep"].named_steps["encode"]
 
 
 def style(fig, height=340):
@@ -80,18 +92,13 @@ with st.sidebar:
     st.metric("Hold-out accuracy", f"{M['holdout']['accuracy']:.1%}")
     st.metric("Hold-out macro-F1", f"{M['holdout']['f1_macro']:.3f}")
     st.caption(f"Tuned params: {M['best_params']}")
-    st.divider()
-    st.header("AI explainer")
-    default_key = os.environ.get("OPENAI_API_KEY", "")
-    try:
-        default_key = default_key or st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        pass
-    api_key = st.text_input("OpenAI API key", value=default_key, type="password",
-                            help="Read from OPENAI_API_KEY or .streamlit/secrets.toml if set. "
-                                 "Without a key a rule-based explanation is shown.")
-    llm_model = st.text_input("OpenAI model", value=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
-    st.caption("🟢 Agent enabled" if api_key else "⚪ No key - rule-based fallback")
+
+api_key = os.environ.get("OPENAI_API_KEY", "")
+try:
+    api_key = api_key or st.secrets.get("OPENAI_API_KEY", "")
+except Exception:
+    pass
+llm_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 st.title("Transaction Classification - EY Challenge")
 tab1, tab2 = st.tabs(["① Exploration, Preprocessing & Model Results", "② Hold-Out Prediction Pipeline"])
@@ -101,215 +108,396 @@ tab1, tab2 = st.tabs(["① Exploration, Preprocessing & Model Results", "② Hol
 # =========================================================================== #
 with tab1:
     d = M["data"]
+    dup_mask = raw.duplicated(subset=INPUT_COLS + ["label"])
+    dedup = raw[~dup_mask]
+    encoder = get_encoder(bundle["model"])
+
     k = st.columns(5)
-    k[0].metric("Raw rows", f"{d['raw_rows']:,}")
-    k[1].metric("Exact duplicates removed", f"{d['duplicates_removed']:,}")
-    k[2].metric("Classes (after cleaning)", raw["label"].nunique(), delta=f"from {raw[LABEL_COL].nunique()} spellings",
-                delta_color="off")
-    k[3].metric("Missing Col4", int(raw["Col4"].isna().sum()))
-    k[4].metric("Majority-class baseline", f"{M['holdout']['majority_baseline_accuracy']:.1%}",
-                help="Accuracy from always predicting Category_1 - the bar to beat.")
+    k[0].metric("Transactions", f"{d['raw_rows']:,}")
+    k[1].metric("Input columns", len(INPUT_COLS))
+    k[2].metric("Target classes", raw["label"].nunique())
+    k[3].metric("Missing cells", f"{int(raw[INPUT_COLS].isna().sum().sum()):,}")
+    k[4].metric("Duplicate rows", f"{int(dup_mask.sum()):,}")
 
-    # ---------------------------------------------------------------- EDA
-    st.header("1 · Data exploration")
-    c1, c2 = st.columns(2)
-    with c1:
-        vc = raw["label"].value_counts().reindex(CLASS_ORDER).fillna(0).reset_index()
-        vc.columns = ["label", "rows"]
-        log_y = st.toggle("Log scale", value=True, key="logcls")
-        fig = px.bar(vc, x="label", y="rows", color="label", color_discrete_map=CLASS_COLORS, text="rows",
-                     log_y=log_y, title="Class distribution - severe imbalance")
-        fig.update_traces(textposition="outside", marker_cornerradius=4)
-        st.plotly_chart(style(fig).update_layout(showlegend=False), width="stretch")
-    with c2:
-        lm = pd.DataFrame(d["label_map"]).rename(columns={LABEL_COL: "raw label", "label": "cleaned"})
-        st.markdown("**Label cleaning** - 11 spellings collapse to 6 classes (regex on the digit)")
-        st.dataframe(lm, hide_index=True, width="stretch", height=300)
+    eda, prep, split, results = st.tabs(["📊 Data exploration", "🧹 Cleaning & preprocessing",
+                                         "✂️ Split strategy", "🤖 Model training & evaluation"])
 
-    st.subheader("Explore a column against the target")
-    col_pick = st.selectbox("Column", INPUT_COLS + ["Col2 shape (engineered)"],
-                            format_func=lambda c: f"{c} - {COLUMN_DESCRIPTIONS.get(c, 'reference-ID format')}")
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        if col_pick == "Col3":
-            show = raw.dropna(subset=["amount"]).assign(abs_amount=lambda x: x["amount"].abs().clip(lower=0.01))
-            fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points="outliers",
-                         color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
-                         title="|Amount| by class (log scale)")
-            st.plotly_chart(style(fig, 380).update_layout(showlegend=False), width="stretch")
-        elif col_pick == "Col5":
-            ct = pd.crosstab(raw["date"].dt.to_period("M").astype(str), raw["label"], normalize="index")
-            fig = px.imshow(ct.T.reindex(CLASS_ORDER).fillna(0), color_continuous_scale=SEQ, aspect="auto",
-                            text_auto=".0%", title="Class mix by posting month (share of month)")
-            st.plotly_chart(style(fig, 380), width="stretch")
-        else:
-            src = "col2_shape" if col_pick.startswith("Col2 shape") else col_pick
-            topn = st.slider("Top N values", 5, 25, 12)
-            top = raw[src].fillna("<missing>").value_counts().head(topn).index
-            sub = raw[raw[src].fillna("<missing>").isin(top)].assign(v=lambda x: x[src].fillna("<missing>"))
-            ct = sub.groupby(["v", "label"]).size().reset_index(name="rows")
-            fig = px.bar(ct, y="v", x="rows", color="label", orientation="h", color_discrete_map=CLASS_COLORS,
-                         category_orders={"label": CLASS_ORDER, "v": list(top)},
-                         title=f"Top {topn} values of {src} - stacked by class")
-            fig.update_traces(marker_line_color="white", marker_line_width=1)
-            st.plotly_chart(style(fig, 420).update_yaxes(title=""), width="stretch")
-    with c2:
+    # ------------------------------------------------------------------ EDA
+    with eda:
+        st.subheader("Dataset at a glance")
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            profile = pd.DataFrame({
+                "Column": INPUT_COLS,
+                "Content": [COLUMN_DESCRIPTIONS[c] for c in INPUT_COLS],
+                "Distinct": [raw[c].nunique() for c in INPUT_COLS],
+                "Missing": [int(raw[c].isna().sum()) for c in INPUT_COLS],
+                "Example": [raw[c].dropna().iloc[0] for c in INPUT_COLS],
+            })
+            st.dataframe(profile, hide_index=True, width="stretch", height=300)
+        with c2:
+            st.dataframe(raw[INPUT_COLS + [LABEL_COL]], width="stretch", height=300)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            vc = raw["label"].value_counts().reindex(CLASS_ORDER).fillna(0).reset_index()
+            vc.columns = ["label", "rows"]
+            log_y = st.toggle("Log scale", value=True, key="logcls")
+            fig = px.bar(vc, x="label", y="rows", color="label", color_discrete_map=CLASS_COLORS, text="rows",
+                         log_y=log_y, title="Target class distribution")
+            fig.update_traces(textposition="outside", marker_cornerradius=4)
+            st.plotly_chart(style(fig).update_layout(showlegend=False).update_xaxes(title=""), width="stretch")
+        with c2:
+            miss = raw[INPUT_COLS].isna().sum().reset_index()
+            miss.columns = ["column", "missing"]
+            miss["share"] = miss["missing"] / len(raw)
+            st.write("")
+            st.write("")
+            fig = px.bar(miss, x="column", y="missing", text="missing", hover_data={"share": ":.1%"},
+                         title="Missing values per column")
+            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
+            st.plotly_chart(style(fig).update_xaxes(title=""), width="stretch")
+
+        st.subheader("Explore a column against the target")
+        col_pick = st.selectbox("Column", INPUT_COLS + ["Col2 shape (engineered)"],
+                                format_func=lambda c: f"{c} - {COLUMN_DESCRIPTIONS.get(c, 'reference-ID format')}")
         src = "col2_shape" if col_pick.startswith("Col2 shape") else col_pick
-        purity = (raw.groupby(src)["label"].agg(lambda s: s.value_counts(normalize=True).iloc[0])
-                  .rename("purity").to_frame().join(raw[src].value_counts().rename("n")))
-        w_purity = float((purity["purity"] * purity["n"]).sum() / purity["n"].sum())
-        st.metric("Distinct values", f"{raw[src].nunique():,}")
-        st.metric("Missing", int(raw[src].isna().sum()))
-        st.metric("Weighted label purity", f"{w_purity:.1%}",
-                  help="If you knew only this column's value, how often would its majority label be right?")
-        if col_pick == "Col2":
-            st.info("Excel mangled some IDs into scientific notation (`4.80Z+11`). Raw IDs are near-unique, "
-                    "so the model uses their **shape** (`KBNZ072618` → `A9`) - which identifies a vendor's "
-                    "numbering format without memorising IDs.")
-        if col_pick == "Col3":
-            q1, q3 = np.log1p(raw["amount"].abs()).quantile([.25, .75])
-            out = ((np.log1p(raw["amount"].abs()) > q3 + 1.5 * (q3 - q1)) |
-                   (np.log1p(raw["amount"].abs()) < q1 - 1.5 * (q3 - q1))).sum()
-            st.metric("Negative amounts (credits)", int((raw["amount"] < 0).sum()))
-            st.metric("IQR outliers on log|amount|", int(out))
-            st.caption("Outliers are kept: large amounts are genuine (e.g. 8.8M payroll-style rows) and are "
-                       "tamed by a signed log transform instead of being dropped.")
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            if col_pick == "Col3":
+                show = raw.dropna(subset=["amount"]).assign(abs_amount=lambda x: x["amount"].abs().clip(lower=0.01))
+                fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points="outliers",
+                             color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
+                             title="Amount by class (absolute value, log scale)")
+                st.plotly_chart(style(fig, 400).update_layout(showlegend=False).update_xaxes(title=""),
+                                width="stretch")
+            elif col_pick == "Col5":
+                ct = pd.crosstab(raw["date"].dt.to_period("M").astype(str), raw["label"], normalize="index")
+                fig = px.imshow(ct.T.reindex(CLASS_ORDER).fillna(0), color_continuous_scale=SEQ, aspect="auto",
+                                text_auto=".0%", title="Class mix by posting month (share of month)")
+                st.plotly_chart(style(fig, 400), width="stretch")
+            else:
+                topn = st.slider("Top N values", 5, 25, 12)
+                vals = raw[src].fillna("<missing>")
+                top = vals.value_counts().head(topn).index
+                ct = raw.assign(v=vals)[vals.isin(top)].groupby(["v", "label"]).size().reset_index(name="rows")
+                fig = px.bar(ct, y="v", x="rows", color="label", orientation="h", color_discrete_map=CLASS_COLORS,
+                             category_orders={"label": CLASS_ORDER, "v": list(top)},
+                             title=f"Top {topn} values of {src} - stacked by class")
+                fig.update_traces(marker_line_color="white", marker_line_width=1)
+                st.plotly_chart(style(fig, 440).update_yaxes(title=""), width="stretch")
+        with c2:
+            purity = (raw.groupby(src)["label"].agg(lambda s: s.value_counts(normalize=True).iloc[0])
+                      .rename("purity").to_frame().join(raw[src].value_counts().rename("n")))
+            st.metric("Distinct values", f"{raw[src].nunique():,}")
+            st.metric("Missing", int(raw[src].isna().sum()))
+            st.metric("Label purity", f"{(purity['purity'] * purity['n']).sum() / purity['n'].sum():.1%}",
+                      help="How often the most common class for a value is the right answer.")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        miss = raw[INPUT_COLS].isna().sum().reset_index()
-        miss.columns = ["column", "missing"]
-        fig = px.bar(miss, x="column", y="missing", text="missing", title="Missing values per column")
-        fig.update_traces(marker_color=CLASS_COLORS["Category_1"], marker_cornerradius=4)
-        st.plotly_chart(style(fig), width="stretch")
-    with c2:
-        corr = eng_all[NUMERIC_FEATURES].assign(
-            **{f"is_{c}": (raw["label"] == c).astype(float) for c in ["Category_1", "Category_2"]}).corr()
-        fig = px.imshow(corr, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto",
-                        title="Correlation - engineered numeric features vs top classes")
-        st.plotly_chart(style(fig, 420), width="stretch")
+        st.subheader("Outliers & correlations")
+        c1, c2 = st.columns(2)
+        with c1:
+            la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
+            q1, q3 = la.quantile([.25, .75])
+            lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+            fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
+            fig.update_traces(marker_color=PRIMARY)
+            for x in (lo, hi):
+                fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
+            fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
+                             ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
+            st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
+                            width="stretch")
+            m = st.columns(3)
+            m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
+            m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
+            m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
+        with c2:
+            corr = eng_all[NUMERIC_FEATURES].assign(
+                **{f"is_{c}": (raw["label"] == c).astype(float) for c in ["Category_1", "Category_2"]}).corr()
+            fig = px.imshow(corr, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto",
+                            title="Correlation - numeric features vs top classes")
+            st.plotly_chart(style(fig, 470), width="stretch")
 
-    # ---------------------------------------------------------------- Preprocessing
-    st.header("2 · Cleaning & preprocessing")
-    steps = pd.DataFrame([
-        ["Labels", "Regex-normalise 11 spellings → Category_1..6", "Typos would otherwise create fake classes"],
-        ["Duplicates", f"Drop {d['duplicates_removed']} exact duplicate rows BEFORE splitting",
-         "Prevents identical rows landing in both train and test (leakage)"],
-        ["Schema", "Coerce any upload to Col1..Col7 (Col#, A–G, or positional); missing cols → blank",
-         "Robust live pipeline"],
-        ["Col1 / Col4 / Col6", "TF-IDF on whitespace tokens, uni+bigrams, sublinear tf", "Token IDs carry vendor/account semantics"],
-        ["Col2", "Character-class shape → one-hot (rare shapes pooled); length, digit share, separator, sci-notation flags",
-         "IDs are unique; their format is informative"],
-        ["Col3", "Strip commas/$ → float; signed log1p; negative & round-number flags", "Heavy right skew, credits"],
-        ["Col5", "Parse date → month, day, month-start / month-end flags", "Posting-period patterns"],
-        ["Col7", "One-hot (unknown values ignored)", "Low-cardinality categorical"],
-        ["Missing values", "Text → empty string; numeric → median imputation (fit on train only)", "No row is ever dropped at inference"],
-        ["Scaling", "StandardScaler on numeric features (fit on train only)", "Comparable scale for the linear model"],
-    ], columns=["Step", "Transformation", "Why"])
-    st.dataframe(steps, hide_index=True, width="stretch")
+    # ------------------------------------------------------------------ Cleaning & preprocessing
+    with prep:
+        STEPS = ["Labels", "Duplicates", "Amount", "Date", "Reference ID", "Missing values",
+                 "Scaling", "Final features"]
+        step = st.segmented_control("Pipeline step", [f"{i + 1}. {s}" for i, s in enumerate(STEPS)],
+                                    default="1. Labels", key="prep_step") or "1. Labels"
+        step = step.split(". ", 1)[1]
+        st.divider()
 
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.markdown("**Before → after** (first rows of the training split)")
-        view = st.radio("View", ["Raw input", "Engineered features"], horizontal=True, label_visibility="collapsed")
-        if view == "Raw input":
-            st.dataframe(pd.read_csv(ROOT / "data" / "train.csv", dtype=str).head(8), hide_index=True,
-                         width="stretch")
-        else:
-            st.dataframe(pd.DataFrame(M["engineered_sample"]), hide_index=True, width="stretch")
-    with c2:
-        dims = pd.Series(M["feature_dims"]).rename_axis("block").reset_index(name="features")
-        fig = px.bar(dims, x="features", y="block", orientation="h", text="features",
-                     title=f"Model input width: {dims['features'].sum():,} features")
-        fig.update_traces(marker_color=CLASS_COLORS["Category_1"], marker_cornerradius=4)
-        st.plotly_chart(style(fig, 300).update_yaxes(title=""), width="stretch")
+        if step == "Labels":
+            lm = pd.DataFrame(d["label_map"])
+            k = st.columns(2)
+            k[0].metric("Before: label spellings", lm[LABEL_COL].nunique())
+            k[1].metric("After: classes", lm["label"].nunique())
+            equal = st.toggle("Equal-width links (show rare spellings clearly)", value=True)
+            tgt = [c for c in CLASS_ORDER if c in set(lm["label"])]
+            src_n = [f"{r[LABEL_COL]!r} ({r['rows']:,})" for _, r in lm.iterrows()]
+            tgt_n = [f"{c} ({lm.loc[lm['label'] == c, 'rows'].sum():,})" for c in tgt]
+            fig = go.Figure(go.Sankey(
+                node=dict(label=src_n + tgt_n, pad=10, thickness=16,
+                          color=["#b8bec6"] * len(src_n) + [CLASS_COLORS[c] for c in tgt]),
+                link=dict(source=list(range(len(lm))), target=[len(lm) + tgt.index(l) for l in lm["label"]],
+                          value=[1] * len(lm) if equal else lm["rows"].tolist(), customdata=lm["rows"],
+                          hovertemplate="%{source.label} → %{target.label}<br>%{customdata:,} rows<extra></extra>",
+                          color=[rgba(CLASS_COLORS[l], .35) for l in lm["label"]])))
+            st.plotly_chart(style(fig, 460).update_layout(title="Raw label → cleaned class"), width="stretch")
 
-    # ---------------------------------------------------------------- Split
-    st.header("3 · Split strategy")
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.markdown(f"""
-- **Deduplicate first** ({d['raw_rows']:,} → {d['dedup_rows']:,} rows), then split - otherwise copies of a
-  test row sit in training and inflate every score.
-- **Stratified 90 / 10 split** ({d['train_rows']:,} train / {d['test_rows']:,} hold-out, seed 42) so rare
-  classes appear in both parts in proportion. The hold-out is saved as `data/holdout_test.csv` and is
-  **touched once**, after model selection.
-- **Validation = 5-fold stratified CV inside the 90%**: used for model comparison *and* hyper-parameter tuning.
-  With only 12–23 rows in some classes, a single fixed validation set would hold 1–2 examples per rare class;
-  CV uses every training row for validation once and gives a variance estimate.
-- **Selection metric = macro-F1** (every class weighs equally). Accuracy alone rewards ignoring rare classes -
-  predicting Category_1 always already scores {M['holdout']['majority_baseline_accuracy']:.0%}.
-- Category_5 has only **2 rows in the whole dataset**; both fell in training, so it cannot be evaluated on the hold-out.
-""")
-    with c2:
-        sc = pd.DataFrame(d["split_counts"])
-        st.dataframe(sc, hide_index=True, width="stretch")
+        elif step == "Duplicates":
+            k = st.columns(3)
+            k[0].metric("Before", f"{len(raw):,} rows")
+            k[1].metric("After", f"{len(dedup):,} rows", delta=f"-{int(dup_mask.sum()):,}", delta_color="off")
+            k[2].metric("Duplicates removed", f"{dup_mask.mean():.1%}")
+            c1, c2 = st.columns(2)
+            with c1:
+                ba = pd.DataFrame({"Before": raw["label"].value_counts(), "After": dedup["label"].value_counts()}) \
+                    .reindex(CLASS_ORDER).fillna(0).reset_index(names="label").melt("label", var_name="stage",
+                                                                                     value_name="rows")
+                fig = px.bar(ba, x="label", y="rows", color="stage", barmode="group", log_y=True, text="rows",
+                             color_discrete_map={"Before": BEFORE, "After": PRIMARY},
+                             title="Rows per class, before vs after")
+                fig.update_traces(marker_cornerradius=4, textposition="outside")
+                st.plotly_chart(style(fig, 380).update_xaxes(title=""), width="stretch")
+            with c2:
+                st.markdown("**Duplicate groups** (identical on every column)")
+                dups = raw[raw.duplicated(subset=INPUT_COLS + ["label"], keep=False)]
+                st.dataframe(dups.sort_values(INPUT_COLS)[INPUT_COLS + ["label"]], hide_index=True,
+                             width="stretch", height=340)
 
-    # ---------------------------------------------------------------- Models
-    st.header("4 · Model training & evaluation")
-    cv = pd.DataFrame(M["cv_comparison"])
-    tbl = cv[["model", "accuracy_mean", "accuracy_std", "f1_macro_mean", "f1_macro_std",
-              "balanced_accuracy_mean", "f1_weighted_mean", "fit_seconds"]].rename(columns={
-        "accuracy_mean": "Accuracy", "accuracy_std": "± acc", "f1_macro_mean": "Macro-F1",
-        "f1_macro_std": "± F1", "balanced_accuracy_mean": "Balanced acc", "f1_weighted_mean": "Weighted F1",
-        "fit_seconds": "5-fold time (s)"})
-    st.dataframe(tbl.style.format({c: "{:.3f}" for c in tbl.columns[1:-1]})
-                 .highlight_max(subset=["Macro-F1"], color="#dbe9fa"), hide_index=True, width="stretch")
+        elif step == "Amount":
+            ex = pd.concat([raw[raw["Col3"].str.contains(",", na=False)].head(3),
+                            raw[raw["amount"] < 0].head(2),
+                            raw[~raw["Col3"].str.contains(",", na=True)].head(2)])
+            st.dataframe(pd.DataFrame({"Before: raw text": ex["Col3"], "Parsed number": ex["amount"],
+                                       "After: signed log": eng_all.loc[ex.index, "amount_signed_log"].round(3),
+                                       "Is negative": eng_all.loc[ex.index, "amount_is_negative"],
+                                       "Is round": eng_all.loc[ex.index, "amount_is_round"]}),
+                         hide_index=True, width="stretch")
+            c1, c2 = st.columns(2)
+            fig = px.histogram(raw["amount"].dropna(), nbins=80, title="Before: raw amount")
+            c1.plotly_chart(style(fig.update_traces(marker_color=BEFORE)).update_layout(showlegend=False)
+                            .update_xaxes(title="amount").update_yaxes(title="rows"), width="stretch")
+            fig = px.histogram(eng_all["amount_signed_log"].dropna(), nbins=80, title="After: signed log(1 + |amount|)")
+            c2.plotly_chart(style(fig.update_traces(marker_color=PRIMARY)).update_layout(showlegend=False)
+                            .update_xaxes(title="signed log amount").update_yaxes(title="rows"), width="stretch")
 
-    c1, c2 = st.columns(2)
-    metric = c1.radio("CV metric per fold", ["f1_macro", "accuracy", "balanced_accuracy"], horizontal=True)
-    folds = pd.DataFrame([{"model": r["model"], "fold": i + 1, "score": s}
-                          for r in M["cv_comparison"] for i, s in enumerate(r[f"{metric}_folds"])])
-    fig = px.strip(folds, x="model", y="score", hover_data=["fold"], title=f"5-fold CV {metric} - each dot is a fold")
-    fig.update_traces(marker=dict(size=11, color=CLASS_COLORS["Category_1"], line=dict(width=2, color="white")))
-    means = folds.groupby("model")["score"].mean()
-    fig.add_trace(go.Scatter(x=means.index, y=means.values, mode="markers", name="mean",
-                             marker=dict(symbol="line-ew-open", size=40, color="#0b0b0b", line_width=2)))
-    c1.plotly_chart(style(fig, 360), width="stretch")
-    with c2:
-        st.markdown(f"**Why {M['best_family']}?**")
-        st.markdown(
-            "- Best macro-F1: the TF-IDF token space is high-dimensional and sparse - linear models with "
-            "`class_weight='balanced'` separate rare classes well where trees need more examples per leaf.\n"
-            "- Tree models / ensemble edge ahead on raw accuracy but lose the rare classes.\n"
-            "- Fast (seconds to train), stable across folds, and its probabilities are well-behaved for explanation.")
-        st.markdown("**Hyper-parameter tuning** (GridSearchCV, same 5 folds, refit on macro-F1)")
-        st.dataframe(pd.DataFrame([{**t["params"], "Macro-F1": round(t["f1_macro"], 4),
-                                    "Accuracy": round(t["accuracy"], 4)} for t in M["tuning"]]),
-                     hide_index=True, width="stretch")
+        elif step == "Date":
+            fmt = raw["Col5"].dropna().map(id_shape)
+            k = st.columns(3)
+            k[0].metric("Date formats found", fmt.nunique())
+            k[1].metric("Unparseable dates", int(raw["date"].isna().sum() - raw["Col5"].isna().sum()))
+            k[2].metric("Features created", 4)
+            ex = raw.dropna(subset=["Col5"]).groupby(fmt).head(2).head(8)
+            st.dataframe(pd.DataFrame({"Before: raw text": ex["Col5"], "Parsed date": ex["date"].dt.date,
+                                       **{c: eng_all.loc[ex.index, c] for c in
+                                          ["month", "day", "is_month_start", "is_month_end"]}}),
+                         hide_index=True, width="stretch")
+            by_m = eng_all["month"].value_counts().sort_index().reset_index()
+            by_m.columns = ["month", "rows"]
+            fig = px.bar(by_m, x="month", y="rows", text="rows", title="After: rows per posting month")
+            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
+            st.plotly_chart(style(fig, 320).update_xaxes(dtick=1), width="stretch")
 
-    st.subheader("Hold-out results (10%, never seen during training or tuning)")
-    H = M["holdout"]
-    k = st.columns(4)
-    k[0].metric("Accuracy", f"{H['accuracy']:.2%}")
-    k[1].metric("Macro-F1 (classes present)", f"{H['f1_macro']:.3f}")
-    k[2].metric("Balanced accuracy", f"{H['balanced_accuracy']:.3f}")
-    k[3].metric("Weighted F1", f"{H['f1_weighted']:.3f}")
+        elif step == "Reference ID":
+            k = st.columns(2)
+            k[0].metric("Before: distinct IDs", f"{raw['Col2'].nunique():,}")
+            k[1].metric("After: distinct ID shapes", f"{raw['col2_shape'].nunique():,}")
+            c1, c2 = st.columns(2)
+            with c1:
+                top = raw["col2_shape"].value_counts().head(12)
+                ex = raw.groupby("col2_shape")["Col2"].first().reindex(top.index)
+                st.dataframe(pd.DataFrame({"Before: example ID": ex.values, "After: shape": top.index,
+                                           "Rows": top.values}), hide_index=True, width="stretch", height=420)
+            with c2:
+                fig = px.bar(top.iloc[::-1].reset_index(), x="count", y="col2_shape", orientation="h", text="count",
+                             title="Most common ID shapes")
+                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
+                st.plotly_chart(style(fig, 420).update_yaxes(title="").update_xaxes(title="rows"), width="stretch")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        norm = st.toggle("Row-normalise (recall per class)", value=False)
-        cm = np.array(H["confusion_matrix"], dtype=float)
-        present = [i for i, l in enumerate(H["labels"]) if cm[i].sum() > 0 or cm[:, i].sum() > 0]
-        cm = cm[np.ix_(present, present)]
-        labs = [H["labels"][i] for i in present]
-        if norm:
-            cm = cm / cm.sum(1, keepdims=True).clip(min=1)
-        fig = px.imshow(cm, x=labs, y=labs, color_continuous_scale=SEQ, text_auto=".2f" if norm else "d",
-                        labels=dict(x="Predicted", y="Actual", color="share" if norm else "rows"),
-                        title="Confusion matrix")
-        st.plotly_chart(style(fig, 420), width="stretch")
-    with c2:
-        rep = pd.DataFrame(H["report"]).T
-        rep = rep[rep["support"] > 0].drop(index=["accuracy"], errors="ignore")
-        st.markdown("**Classification report** (classes with hold-out support)")
-        st.dataframe(rep.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1-score": "{:.3f}",
-                                       "support": "{:.0f}"}), width="stretch")
-        imp = pd.DataFrame(M["column_importance"]).T.reset_index(names="column").sort_values("mean")
-        fig = px.bar(imp, x="mean", y="column", error_x="std", orientation="h",
-                     title="Which raw columns matter? (permutation: drop in hold-out macro-F1)")
-        fig.update_traces(marker_color=CLASS_COLORS["Category_1"], marker_cornerradius=4)
-        st.plotly_chart(style(fig, 320).update_xaxes(title="macro-F1 drop when shuffled"), width="stretch")
+        elif step == "Missing values":
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                mv = pd.DataFrame({"column": INPUT_COLS, "Before": raw[INPUT_COLS].isna().sum().values,
+                                   "After": 0}).melt("column", var_name="stage", value_name="missing")
+                fig = px.bar(mv, x="column", y="missing", color="stage", barmode="group", text="missing",
+                             color_discrete_map={"Before": BEFORE, "After": PRIMARY},
+                             title="Missing values, before vs after")
+                fig.update_traces(marker_cornerradius=4, textposition="outside")
+                st.plotly_chart(style(fig, 360).update_xaxes(title=""), width="stretch")
+            with c2:
+                st.dataframe(pd.DataFrame([
+                    ["Col1, Col4, Col6", "Empty text"],
+                    ["Col2", "'<missing>' shape"],
+                    ["Col3", "Median (from training data)"],
+                    ["Col5", "Median month / day (from training data)"],
+                    ["Col7", "'<missing>' category"],
+                    ["Col4", "+ flag: col4_missing"],
+                ], columns=["Column", "Filled with"]), hide_index=True, width="stretch")
+
+        elif step == "Scaling":
+            num = encoder.named_transformers_["numeric"]
+            feat = st.selectbox("Numeric feature", NUMERIC_FEATURES)
+            imputed = num.named_steps["impute"].transform(eng_all[NUMERIC_FEATURES])
+            scaled = pd.DataFrame(num.named_steps["scale"].transform(imputed), columns=NUMERIC_FEATURES)
+            before = pd.Series(imputed[:, NUMERIC_FEATURES.index(feat)])
+            c1, c2 = st.columns(2)
+            for col, s, name, color in [(c1, before, "Before", BEFORE), (c2, scaled[feat], "After", PRIMARY)]:
+                fig = px.histogram(s, nbins=50, title=f"{name}: {feat}")
+                fig.update_traces(marker_color=color)
+                col.plotly_chart(style(fig, 320).update_layout(showlegend=False).update_xaxes(title="")
+                                 .update_yaxes(title="rows"), width="stretch")
+                m = col.columns(2)
+                m[0].metric("Mean", f"{s.mean():.2f}")
+                m[1].metric("Std", f"{s.std(ddof=0):.2f}")
+
+        else:  # Final features
+            c1, c2 = st.columns([2, 3])
+            with c1:
+                dims = pd.Series(M["feature_dims"]).rename(lambda b: b.replace("_tfidf", " text").capitalize()) \
+                    .rename_axis("block").reset_index(name="features")
+                fig = px.bar(dims, x="features", y="block", orientation="h", text="features",
+                             title=f"7 raw columns → {dims['features'].sum():,} model features")
+                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
+                st.plotly_chart(style(fig, 360).update_yaxes(title=""), width="stretch")
+            with c2:
+                i = st.number_input("Trace one transaction - row", 0, len(raw) - 1, 0, step=1)
+                a, b = st.columns(2)
+                a.markdown("**Before: raw**")
+                a.dataframe(raw.loc[i, INPUT_COLS + ["label"]].astype(str).rename("value").to_frame(),
+                            width="stretch", height=300)
+                b.markdown("**After: engineered**")
+                b.dataframe(eng_all.loc[i].astype(str).rename("value").to_frame(), width="stretch", height=300)
+
+    # ------------------------------------------------------------------ Split
+    with split:
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            fig = go.Figure(go.Sankey(
+                node=dict(label=[f"All rows ({d['raw_rows']:,})", f"Duplicates removed ({d['duplicates_removed']:,})",
+                                 f"Unique rows ({d['dedup_rows']:,})", f"Train 90% ({d['train_rows']:,})",
+                                 f"Hold-out test 10% ({d['test_rows']:,})"],
+                          color=[BEFORE, "#e34948", PRIMARY, PRIMARY, CLASS_COLORS["Category_2"]],
+                          pad=18, thickness=18),
+                link=dict(source=[0, 0, 2, 2], target=[1, 2, 3, 4],
+                          value=[d["duplicates_removed"], d["dedup_rows"], d["train_rows"], d["test_rows"]],
+                          color="rgba(42,120,214,0.18)")))
+            st.plotly_chart(style(fig, 340).update_layout(title="How the data was partitioned"), width="stretch")
+        with c2:
+            sc = pd.DataFrame(d["split_counts"]).set_index("label")
+            sh = (sc / sc.sum()).reset_index().melt("label", var_name="split", value_name="share")
+            sh["split"] = sh["split"].map({"train": "Train", "holdout": "Hold-out"})
+            fig = px.bar(sh, x="split", y="share", color="label", color_discrete_map=CLASS_COLORS,
+                         category_orders={"label": CLASS_ORDER}, title="Class mix is identical in both parts",
+                         hover_data={"share": ":.2%"})
+            fig.update_yaxes(tickformat=".0%", title="")
+            st.plotly_chart(style(fig, 340).update_xaxes(title=""), width="stretch")
+
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            z = np.eye(5)
+            fig = go.Figure(go.Heatmap(z=z, x=[f"Part {i}" for i in range(1, 6)], y=[f"Fold {i}" for i in range(1, 6)],
+                                       colorscale=[[0, "#dbe9fa"], [1, CLASS_COLORS["Category_4"]]], showscale=False,
+                                       text=np.where(z == 1, "Validate", "Train"), texttemplate="%{text}",
+                                       xgap=3, ygap=3, hoverinfo="skip"))
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(style(fig, 300).update_layout(title="5-fold stratified cross-validation inside the 90%"),
+                            width="stretch")
+        with c2:
+            t = sc.assign(total=sc.sum(axis=1), **{"hold-out %": (sc["holdout"] / sc.sum(axis=1)).map("{:.0%}".format)})
+            st.dataframe(t, width="stretch")
+            st.markdown(
+                "- Duplicates removed **before** splitting\n"
+                "- **Stratified** 90 / 10 split (seed 42)\n"
+                "- 5-fold CV on the 90% for model choice & tuning\n"
+                "- Hold-out scored **once**, at the end")
+
+    # ------------------------------------------------------------------ Model results
+    with results:
+        METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy",
+                   "f1_weighted": "Weighted F1"}
+        metric = st.segmented_control("Metric", list(METRICS), format_func=METRICS.get, default="f1_macro",
+                                      key="cv_metric") or "f1_macro"
+        c1, c2 = st.columns(2)
+        with c1:
+            cv = pd.DataFrame(M["cv_comparison"])
+            cv["selected"] = np.where(cv["model"] == M["best_family"], "Selected", "Other")
+            fig = px.bar(cv, x="model", y=f"{metric}_mean", error_y=f"{metric}_std", color="selected",
+                         text=cv[f"{metric}_mean"].round(3), hover_data={"fit_seconds": True},
+                         color_discrete_map={"Selected": PRIMARY, "Other": BEFORE},
+                         title=f"Algorithms compared - 5-fold CV {METRICS[metric]}")
+            fig.update_traces(marker_cornerradius=4, textposition="inside")
+            st.plotly_chart(style(fig, 380).update_layout(showlegend=False).update_xaxes(title="")
+                            .update_yaxes(title=METRICS[metric]), width="stretch")
+        with c2:
+            folds = pd.DataFrame([{"model": r["model"], "fold": i + 1, "score": s}
+                                  for r in M["cv_comparison"] for i, s in enumerate(r[f"{metric}_folds"])])
+            fig = px.strip(folds, x="model", y="score", hover_data=["fold"], title="Score on each CV fold")
+            fig.update_traces(marker=dict(size=11, color=PRIMARY, line=dict(width=2, color="white")))
+            means = folds.groupby("model")["score"].mean()
+            fig.add_trace(go.Scatter(x=means.index, y=means.values, mode="markers", name="mean",
+                                     marker=dict(symbol="line-ew-open", size=40, color="#0b0b0b", line_width=2)))
+            st.plotly_chart(style(fig, 380).update_xaxes(title="").update_yaxes(title=METRICS[metric]),
+                            width="stretch")
+
+        tune = pd.DataFrame([{**t["params"], "Macro-F1": t["f1_macro"], "Accuracy": t["accuracy"]}
+                             for t in M["tuning"]])
+        pcols = [c for c in tune.columns if c not in ("Macro-F1", "Accuracy")]
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            if len(pcols) == 1 and pd.api.types.is_numeric_dtype(tune[pcols[0]]):
+                p = pcols[0]
+                tl = tune.melt(p, ["Macro-F1", "Accuracy"], var_name="metric", value_name="score")
+                fig = px.line(tl, x=p, y="score", color="metric", markers=True, log_x=True,
+                              color_discrete_map={"Macro-F1": PRIMARY, "Accuracy": CLASS_COLORS["Category_2"]},
+                              title=f"Hyper-parameter tuning - {M['best_family']} ({p.split('__')[-1]})")
+                fig.add_vline(x=float(M["best_params"][p]), line_dash="dash", line_color="#6b7280",
+                              annotation_text="selected")
+                st.plotly_chart(style(fig, 320).update_xaxes(title=p.split("__")[-1]), width="stretch")
+            else:
+                st.markdown(f"**Hyper-parameter tuning - {M['best_family']}**")
+                st.dataframe(tune, hide_index=True, width="stretch")
+        with c2:
+            st.metric("Selected model", M["best_family"])
+            st.metric("Best parameters", ", ".join(f"{k.split('__')[-1]} = {v}" for k, v in M["best_params"].items()))
+            st.metric("Tuning search", f"{len(tune)} settings × 5 folds")
+
+        st.subheader("Hold-out test results")
+        H = M["holdout"]
+        k = st.columns(4)
+        k[0].metric("Accuracy", f"{H['accuracy']:.2%}",
+                    delta=f"{(H['accuracy'] - H['majority_baseline_accuracy']) * 100:+.1f} pts vs baseline")
+        k[1].metric("Macro-F1", f"{H['f1_macro']:.3f}")
+        k[2].metric("Balanced accuracy", f"{H['balanced_accuracy']:.3f}")
+        k[3].metric("Weighted F1", f"{H['f1_weighted']:.3f}")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            norm = st.toggle("Show as % of actual class", value=False)
+            cm = np.array(H["confusion_matrix"], dtype=float)
+            present = [i for i, l in enumerate(H["labels"]) if cm[i].sum() > 0 or cm[:, i].sum() > 0]
+            cm = cm[np.ix_(present, present)]
+            labs = [H["labels"][i] for i in present]
+            if norm:
+                cm = cm / cm.sum(1, keepdims=True).clip(min=1)
+            fig = px.imshow(cm, x=labs, y=labs, color_continuous_scale=SEQ, text_auto=".0%" if norm else "d",
+                            labels=dict(x="Predicted", y="Actual", color="share" if norm else "rows"),
+                            title="Confusion matrix")
+            st.plotly_chart(style(fig, 440), width="stretch")
+        with c2:
+            rep = pd.DataFrame(H["report"]).T
+            rep = rep[rep["support"] > 0].drop(index=["accuracy"], errors="ignore")
+            st.markdown("**Classification report**")
+            st.dataframe(rep.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1-score": "{:.3f}",
+                                           "support": "{:.0f}"}), width="stretch")
+            imp = pd.DataFrame(M["column_importance"]).T.reset_index(names="column").sort_values("mean")
+            fig = px.bar(imp, x="mean", y="column", error_x="std", orientation="h",
+                         title="Column importance (drop in macro-F1 when shuffled)")
+            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
+            st.plotly_chart(style(fig, 300).update_xaxes(title="macro-F1 drop").update_yaxes(title=""),
+                            width="stretch")
 
 # =========================================================================== #
 # TAB 2
@@ -367,7 +555,7 @@ with tab2:
 
                     t = time.time()
                     preds = predict_frame(bundle, X_up)
-                    st.write(f"✅ Encoded (TF-IDF / one-hot / scaling) and scored with **{bundle['model_name']}** "
+                    st.write(f"✅ Encoded features and scored with **{bundle['model_name']}** "
                              f"({time.time()-t:.2f}s)")
                     truth = None
                     lab_col = next((c for c in df_up.columns if c.strip().lower() in

@@ -80,12 +80,24 @@ def main():
     t0 = time.time()
     raw = pd.read_csv(ROOT / "Challenge_Data.csv", dtype=str)
     raw["label"] = raw[LABEL_COL].map(normalize_label)
+    unreadable = raw["label"].isna()
+    if unreadable.any():  # report and set aside rather than guess a class
+        print(f"dropped {unreadable.sum()} rows with unreadable labels: "
+              f"{sorted(raw.loc[unreadable, LABEL_COL].astype(str).unique())}")
+        raw = raw[~unreadable].reset_index(drop=True)
     label_map = (raw.groupby([LABEL_COL, "label"]).size().reset_index(name="rows")
                  .sort_values("label").to_dict("records"))
 
     n_raw = len(raw)
     dedup = raw.drop_duplicates(subset=INPUT_COLS + ["label"]).reset_index(drop=True)
     print(f"rows {n_raw} -> {len(dedup)} after removing exact duplicates")
+
+    # A stratified split needs at least 2 rows per class; warn and set aside instead of crashing.
+    counts = dedup["label"].value_counts()
+    too_rare = counts[counts < 2].index.tolist()
+    if too_rare:
+        print(f"WARNING: classes with <2 rows cannot be split or evaluated, set aside: {too_rare}")
+        dedup = dedup[~dedup["label"].isin(too_rare)].reset_index(drop=True)
 
     X, y = dedup[INPUT_COLS], dedup["label"]
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.10, stratify=y, random_state=SEED)

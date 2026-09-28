@@ -40,13 +40,23 @@ NUMERIC_FEATURES = [
 # --------------------------------------------------------------------------- #
 # Label cleaning
 # --------------------------------------------------------------------------- #
+WORD_NUMS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "six": 6, "seven": 7, "eight": 8, "nine": 9}
+
+
 def normalize_label(raw) -> str | float:
     """Map the 11 inconsistent spellings ('Category 3', 'Categry_6',
-    'category_1', 'Category4', 'Category _3' ...) onto 'Category_<n>'."""
+    'category_1', 'Category4', 'Category _3' ...) onto 'Category_<n>'.
+    Also handles 'Category Three', 'Category_07' and 'v2 Category_4'
+    (takes the number after 'cat...', not the first number). Unreadable -> NaN."""
     if pd.isna(raw):
         return np.nan
-    m = re.search(r"(\d+)", str(raw))
-    return f"Category_{m.group(1)}" if m else np.nan
+    s = str(raw).lower()
+    for word, n in WORD_NUMS.items():                     # "three" -> "3"
+        s = re.sub(rf"\b{word}\b", str(n), s)
+    m = (re.search(r"cat[a-z]*\D*?(\d+)", s)              # number right after "cat..."
+         or re.search(r"(\d+)", s))                       # fallback: any number ("3")
+    return f"Category_{int(m.group(1))}" if m else np.nan  # int() drops leading zeros
 
 
 # --------------------------------------------------------------------------- #
