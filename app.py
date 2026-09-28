@@ -19,10 +19,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.explain import fallback_explanation, feature_contributions, predict_frame, run_agent
-from src.pipeline import (COLUMN_DESCRIPTIONS, INPUT_COLS, LABEL_COL, MODEL_NUMERIC_FEATURES,
-                          coerce_schema, engineer_features, id_shape, normalize_label, parse_amount)
+from src.pipeline import (COLUMN_DESCRIPTIONS, DROPPED_COLS, INPUT_COLS, LABEL_COL, MODEL_NUMERIC_FEATURES,
+                          coerce_schema, engineer_features, normalize_label, parse_amount)
 
 ROOT = Path(__file__).parent
+MODEL_COLS = [c for c in INPUT_COLS if c not in DROPPED_COLS]
+SHORT_NAMES = {"Col1": "vendor name", "Col2": "reference ID", "Col3": "amount", "Col4": "line description",
+               "Col5": "posting date", "Col6": "account description", "Col7": "document type"}
+DROPPED_NOTE = ("**The model ignores " + " and ".join(f"{SHORT_NAMES[c]} ({c})" for c in DROPPED_COLS) + ".** "
+                "We trained it with and without them and it classified transactions at least as well without "
+                "them, so we left them out. It uses " + ", ".join(SHORT_NAMES[c] for c in MODEL_COLS[:-1])
+                + " and " + SHORT_NAMES[MODEL_COLS[-1]] + ". "
+                "The ignored columns still appear in the Data exploration charts.")
 st.set_page_config(page_title="Transaction Classifier", page_icon="📊", layout="wide")
 
 # Validated categorical order (one fixed hue per class, never cycled) + recessive chart chrome.
@@ -213,8 +221,8 @@ with tab1:
 
     # ------------------------------------------------------------------ Cleaning & preprocessing
     with prep:
-        STEPS = ["Labels", "Duplicates", "Amount", "Date", "Reference ID", "Missing values",
-                 "Scaling", "Final features"]
+        st.info(DROPPED_NOTE, icon="ℹ️")
+        STEPS = ["Labels", "Duplicates", "Amount", "Missing values", "Scaling"]
         step = st.segmented_control("Pipeline step", [f"{i + 1}. {s}" for i, s in enumerate(STEPS)],
                                     default="1. Labels", key="prep_step") or "1. Labels"
         step = step.split(". ", 1)[1]
@@ -276,38 +284,10 @@ with tab1:
             c2.plotly_chart(style(fig.update_traces(marker_color=PRIMARY)).update_layout(showlegend=False)
                             .update_xaxes(title="signed log amount").update_yaxes(title="rows"), width="stretch")
 
-        elif step == "Date":
-            fmt = raw["Col5"].dropna().map(id_shape)
-            k = st.columns(3)
-            k[0].metric("Date formats found", fmt.nunique())
-            k[1].metric("Unparseable dates", int(raw["date"].isna().sum() - raw["Col5"].isna().sum()))
-            k[2].metric("Features created", 4)
-            ex = raw.dropna(subset=["Col5"]).groupby(fmt).head(2).head(8)
-            st.dataframe(pd.DataFrame({"Before: raw text": ex["Col5"], "Parsed date": ex["date"].dt.date,
-                                       **{c: eng_all.loc[ex.index, c] for c in
-                                          ["month", "day", "is_month_start", "is_month_end"]}}),
-                         hide_index=True, width="stretch")
-
-        elif step == "Reference ID":
-            k = st.columns(2)
-            k[0].metric("Before: distinct IDs", f"{raw['Col2'].nunique():,}")
-            k[1].metric("After: distinct ID shapes", f"{raw['col2_shape'].nunique():,}")
-            c1, c2 = st.columns(2)
-            with c1:
-                top = raw["col2_shape"].value_counts().head(12)
-                ex = raw.groupby("col2_shape")["Col2"].first().reindex(top.index)
-                st.dataframe(pd.DataFrame({"Before: example ID": ex.values, "After: shape": top.index,
-                                           "Rows": top.values}), hide_index=True, width="stretch", height=420)
-            with c2:
-                fig = px.bar(top.iloc[::-1].reset_index(), x="count", y="col2_shape", orientation="h", text="count",
-                             title="Most common ID shapes")
-                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
-                st.plotly_chart(style(fig, 420).update_yaxes(title="").update_xaxes(title="rows"), width="stretch")
-
         elif step == "Missing values":
             c1, c2 = st.columns([3, 2])
             with c1:
-                mv = pd.DataFrame({"column": INPUT_COLS, "Before": raw[INPUT_COLS].isna().sum().values,
+                mv = pd.DataFrame({"column": MODEL_COLS, "Before": raw[MODEL_COLS].isna().sum().values,
                                    "After": 0}).melt("column", var_name="stage", value_name="missing")
                 fig = px.bar(mv, x="column", y="missing", color="stage", barmode="group", text="missing",
                              color_discrete_map={"Before": BEFORE, "After": PRIMARY},
@@ -317,14 +297,12 @@ with tab1:
             with c2:
                 st.dataframe(pd.DataFrame([
                     ["Col1, Col4, Col6", "Empty text"],
-                    ["Col2", "'<missing>' shape"],
                     ["Col3", "Median (from training data)"],
-                    ["Col5", "Median month / day (from training data)"],
                     ["Col7", "'<missing>' category"],
                     ["Col4", "+ flag: col4_missing"],
                 ], columns=["Column", "Filled with"]), hide_index=True, width="stretch")
 
-        elif step == "Scaling":
+        else:  # Scaling
             num = encoder.named_transformers_["numeric"]
             feat = st.selectbox("Numeric feature", MODEL_NUMERIC_FEATURES)
             imputed = num.named_steps["impute"].transform(eng_all[MODEL_NUMERIC_FEATURES])
@@ -340,23 +318,6 @@ with tab1:
                 m[0].metric("Mean", f"{s.mean():.2f}")
                 m[1].metric("Std", f"{s.std(ddof=0):.2f}")
 
-        else:  # Final features
-            c1, c2 = st.columns([2, 3])
-            with c1:
-                dims = pd.Series(M["feature_dims"]).rename(lambda b: b.replace("_tfidf", " text").capitalize()) \
-                    .rename_axis("block").reset_index(name="features")
-                fig = px.bar(dims, x="features", y="block", orientation="h", text="features",
-                             title=f"7 raw columns → {dims['features'].sum():,} model features")
-                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
-                st.plotly_chart(style(fig, 360).update_yaxes(title=""), width="stretch")
-            with c2:
-                i = st.number_input("Trace one transaction - row", 0, len(raw) - 1, 0, step=1)
-                a, b = st.columns(2)
-                a.markdown("**Before: raw**")
-                a.dataframe(raw.loc[i, INPUT_COLS + ["label"]].astype(str).rename("value").to_frame(),
-                            width="stretch", height=300)
-                b.markdown("**After: engineered**")
-                b.dataframe(eng_all.loc[i].astype(str).rename("value").to_frame(), width="stretch", height=300)
 
     # ------------------------------------------------------------------ Split
     with split:
@@ -403,6 +364,7 @@ with tab1:
 
     # ------------------------------------------------------------------ Model results
     with results:
+        st.info(DROPPED_NOTE, icon="ℹ️")
         METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy",
                    "f1_weighted": "Weighted F1"}
         metric = st.segmented_control("Metric", list(METRICS), format_func=METRICS.get, default="f1_macro",
@@ -479,7 +441,8 @@ with tab1:
             st.markdown("**Classification report**")
             st.dataframe(rep.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1-score": "{:.3f}",
                                            "support": "{:.0f}"}), width="stretch")
-            imp = pd.DataFrame(M["column_importance"]).T.reset_index(names="column").sort_values("mean")
+            imp = (pd.DataFrame(M["column_importance"]).T.reindex(MODEL_COLS).reset_index(names="column")
+                   .sort_values("mean"))
             fig = px.bar(imp, x="mean", y="column", error_x="std", orientation="h",
                          title="Column importance (drop in macro-F1 when shuffled)")
             fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
