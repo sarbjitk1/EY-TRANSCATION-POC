@@ -12,9 +12,8 @@ import json
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import NearestNeighbors
-from sklearn.pipeline import Pipeline
 
-from .pipeline import COLUMN_DESCRIPTIONS, INPUT_COLS, TEXT_COLS, coerce_schema
+from .pipeline import COLUMN_DESCRIPTIONS, INPUT_COLS, TEXT_COLS, base_pipeline, coerce_schema, thresholded_predict
 
 
 # --------------------------------------------------------------------------- #
@@ -22,12 +21,15 @@ from .pipeline import COLUMN_DESCRIPTIONS, INPUT_COLS, TEXT_COLS, coerce_schema
 # --------------------------------------------------------------------------- #
 def predict_frame(bundle: dict, X_raw: pd.DataFrame) -> pd.DataFrame:
     X, _ = coerce_schema(X_raw)
-    proba = bundle["model"].predict_proba(X)
-    classes = np.array(bundle["model"].classes_)
-    top = proba.argmax(1)
+    model = bundle["model"]
+    proba = model.predict_proba(X)
+    classes = np.array(model.classes_)
+    pred = model.predict(X)  # applies the Category_2 cut-off, not a plain argmax
     out = X.copy()
-    out.insert(0, "Predicted", classes[top])
-    out.insert(1, "Confidence", proba.max(1).round(4))
+    out.insert(0, "Predicted", pred)
+    out.insert(1, "Confidence", proba[np.arange(len(pred)), np.searchsorted(classes, pred)].round(4))
+    # The model is far weaker on vendors it never saw in training - flag them for review.
+    out.insert(2, "Known vendor", X["Col1"].isin(set(bundle["train"]["Col1"].dropna())))
     for i, c in enumerate(classes):
         out[f"P({c})"] = proba[:, i].round(4)
     return out
@@ -56,7 +58,8 @@ def feature_contributions(bundle: dict, row: pd.Series) -> dict:
             meta.append(("token", c, t))
 
     P = model.predict_proba(pd.DataFrame(variants).reset_index(drop=True))
-    k = int(P[0].argmax())
+    decided = thresholded_predict(P, classes, getattr(model, "min_proba", None))
+    k = classes.index(decided[0])
     pred, p0 = classes[k], float(P[0, k])
 
     def effect(delta: float) -> str:
@@ -65,21 +68,21 @@ def feature_contributions(bundle: dict, row: pd.Series) -> dict:
         return f"supports {pred}" if delta > 0 else f"works against {pred}"
 
     columns, tokens = [], []
-    for (kind, col, tok), p in zip(meta[1:], P[1:]):
+    for (kind, col, tok), p, decision in zip(meta[1:], P[1:], decided[1:]):
         delta = round(p0 - float(p[k]), 4)
         if kind == "column":
             columns.append({"column": col, "meaning": COLUMN_DESCRIPTIONS[col], "value": row[col],
                             "neutral_value": base[col] or "<blank>",
                             "contribution": delta, "effect": effect(delta),
                             f"P({pred})_if_neutralised": round(float(p[k]), 4),
-                            "prediction_if_neutralised": classes[int(p.argmax())]})
+                            "prediction_if_neutralised": decision})
         else:
             tokens.append({"column": col, "token": tok, "contribution": delta, "effect": effect(delta)})
     columns.sort(key=lambda d: -abs(d["contribution"]))
     tokens.sort(key=lambda d: -abs(d["contribution"]))
-    order = P[0].argsort()[::-1]
+    runner = max((i for i in range(len(classes)) if i != k), key=lambda i: P[0, i])
     return {"predicted_class": pred, "confidence": round(p0, 4),
-            "runner_up_class": classes[int(order[1])], "runner_up_probability": round(float(P[0, order[1]]), 4),
+            "runner_up_class": classes[runner], "runner_up_probability": round(float(P[0, runner]), 4),
             "probabilities": {c: round(float(v), 4) for c, v in zip(classes, P[0])},
             "how_to_read": f"contribution = P({pred}) with the real value minus P({pred}) with the input "
                            f"neutralised. Positive = the input pushes TOWARD {pred}; negative = it pushes "
@@ -89,9 +92,7 @@ def feature_contributions(bundle: dict, row: pd.Series) -> dict:
 
 def _embedder(bundle: dict):
     """Fitted preprocessing from the final model, used as the similarity space."""
-    m = bundle["model"]
-    pipe = m if isinstance(m, Pipeline) else m.estimators_[0]
-    return pipe.named_steps["prep"]
+    return base_pipeline(bundle["model"]).named_steps["prep"]
 
 
 def similar_training_records(bundle: dict, row: pd.Series, k: int = 5) -> dict:
