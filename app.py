@@ -617,17 +617,17 @@ with tab2:
             k[4].metric("Live accuracy vs provided labels", f"{(preds.loc[m, 'Actual'] == preds.loc[m, 'Predicted']).mean():.2%}")
             y_true, y_pred = preds.loc[m, "Actual"], preds.loc[m, "Predicted"]
             labels = CLASS_ORDER + sorted(set(y_true) - set(CLASS_ORDER))
-            c1, c2 = st.columns(2)
-            with c1:
+            _, mid, _ = st.columns([1, 2, 1])
+            with mid:
                 norm = st.toggle("Show as % of actual class", value=False, key="live_norm")
                 st.plotly_chart(confusion_fig(confusion_matrix(y_true, y_pred, labels=labels), labels, norm,
                                               f"Confusion matrix on uploaded labels ({int(m.sum()):,} rows)"),
                                 width="stretch")
-            with c2:
-                st.markdown("**Per-class report**")
-                st.dataframe(report_table(classification_report(y_true, y_pred, labels=sorted(set(y_true)),
-                                                                output_dict=True, zero_division=0)),
-                             width="stretch")
+            # with c2:
+            #     st.markdown("**Per-class report**")
+            #     st.dataframe(report_table(classification_report(y_true, y_pred, labels=sorted(set(y_true)),
+            #                                                     output_dict=True, zero_division=0)),
+            #                  width="stretch")
 
         f1, f2, f3 = st.columns([2, 1, 1])
         cls_filter = f1.multiselect("Filter predicted class", CLASS_ORDER,
