@@ -231,6 +231,59 @@ with tab1:
             fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
             st.plotly_chart(style(fig).update_xaxes(title=""), width="stretch")
 
+        st.subheader("Explore a column against the target")
+        col_pick = st.selectbox("Column", INPUT_COLS + ["Col2 shape (engineered)"],
+                                format_func=lambda c: f"{c} - {COLUMN_DESCRIPTIONS.get(c, 'reference-ID format')}")
+        src = "col2_shape" if col_pick.startswith("Col2 shape") else col_pick
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            if col_pick == "Col3":
+                show = raw.dropna(subset=["amount"]).assign(abs_amount=lambda x: x["amount"].abs().clip(lower=0.01))
+                fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points="outliers",
+                             color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
+                             title="Amount by class (absolute value, log scale)")
+                st.plotly_chart(style(fig, 400).update_layout(showlegend=False).update_xaxes(title=""),
+                                width="stretch")
+            elif col_pick == "Col5":
+                ct = pd.crosstab(raw["date"].dt.to_period("M").astype(str), raw["label"], normalize="index")
+                fig = px.imshow(ct.T.reindex(CLASS_ORDER).fillna(0), color_continuous_scale=SEQ, aspect="auto",
+                                text_auto=".0%", title="Class mix by posting month (share of month)")
+                st.plotly_chart(style(fig, 400), width="stretch")
+            else:
+                topn = st.slider("Top N values", 5, 25, 12)
+                vals = raw[src].fillna("<missing>")
+                top = vals.value_counts().head(topn).index
+                ct = raw.assign(v=vals)[vals.isin(top)].groupby(["v", "label"]).size().reset_index(name="rows")
+                fig = px.bar(ct, y="v", x="rows", color="label", orientation="h", color_discrete_map=CLASS_COLORS,
+                             category_orders={"label": CLASS_ORDER, "v": list(top)},
+                             title=f"Top {topn} values of {src} - stacked by class")
+                fig.update_traces(marker_line_color="white", marker_line_width=1)
+                st.plotly_chart(style(fig, 440).update_yaxes(title=""), width="stretch")
+        with c2:
+            purity = (raw.groupby(src)["label"].agg(lambda s: s.value_counts(normalize=True).iloc[0])
+                      .rename("purity").to_frame().join(raw[src].value_counts().rename("n")))
+            st.metric("Distinct values", f"{raw[src].nunique():,}")
+            st.metric("Missing", int(raw[src].isna().sum()))
+            st.metric("Label purity", f"{(purity['purity'] * purity['n']).sum() / purity['n'].sum():.1%}",
+                      help="How often the most common class for a value is the right answer.")
+
+        st.subheader("Outliers")
+        la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
+        q1, q3 = la.quantile([.25, .75])
+        lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+        fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
+        fig.update_traces(marker_color=PRIMARY)
+        for x in (lo, hi):
+            fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
+        fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
+                         ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
+        st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
+                        width="stretch")
+        m = st.columns(3)
+        m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
+        m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
+        m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
+
         st.subheader("How each column relates to the category")
         lab = dedup.dropna(subset=["label"])
         assoc = column_association(lab[INPUT_COLS + ["label", "amount", "date"]])
@@ -250,36 +303,6 @@ with tab1:
                                                      range=[0, 1.1])
                         .update_yaxes(title="").update_layout(legend=dict(orientation="h", y=-0.14)),
                         width="stretch")
-
-        st.markdown("**Amount by category**")
-        show = lab.dropna(subset=["amount"]).assign(abs_amount=lambda t: t["amount"].abs().clip(lower=0.01))
-        fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points=False,
-                     color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
-                     title="Transaction amount for each category (log scale)")
-        st.plotly_chart(style(fig, 380).update_layout(showlegend=False).update_xaxes(title="")
-                        .update_yaxes(title="amount"), width="stretch")
-        med = show.groupby("label")["abs_amount"].median()
-        st.caption("Each box covers the middle half of that category's amounts; the line inside is the median. "
-                   + ", ".join(f"{c}: {fmt_amount(med[c])}" for c in CLASS_ORDER if c in med)
-                   + " (medians). Category_2 transactions tend to be smaller and Category_4 much larger, which is "
-                   "why amount helps the model even though its overall relationship score is modest.")
-
-        st.subheader("Outliers")
-        la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
-        q1, q3 = la.quantile([.25, .75])
-        lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
-        fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
-        fig.update_traces(marker_color=PRIMARY)
-        for x in (lo, hi):
-            fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
-        fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
-                         ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
-        st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
-                        width="stretch")
-        m = st.columns(3)
-        m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
-        m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
-        m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
 
     # ------------------------------------------------------------------ Cleaning & preprocessing
     with prep:
@@ -426,15 +449,10 @@ with tab1:
 
     # ------------------------------------------------------------------ Model results
     with results:
-        st.info(DROPPED_NOTE, icon="ℹ️")
         CV = M["cv_results"]
         n_rep = CV["n_repeats"]
         METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy",
                    "f1_weighted": "Weighted F1"}
-        st.caption(f"**How we test.** Every score below comes from 5-fold cross-validation, repeated {n_rep} times "
-                   f"with different shuffles: each training row is predicted by a model that never saw it, and "
-                   f"each repeat is scored once over all rows. Macro-F1 is the average F1 over the categories "
-                   f"present, so each category counts equally no matter how rare it is.")
         metric = st.segmented_control("Metric", list(METRICS), format_func=METRICS.get, default="f1_macro",
                                       key="cv_metric") or "f1_macro"
         c1, c2 = st.columns(2)
@@ -459,10 +477,6 @@ with tab1:
             st.plotly_chart(style(fig, 380).update_xaxes(title="").update_yaxes(title=METRICS[metric]),
                             width="stretch")
         others = [r for r in M["cv_comparison"] if r["model"] != M["best_family"]]
-        st.caption("**Repeat-by-repeat against " + M["best_family"] + " (macro-F1, same splits):** " + " · ".join(
-            f"{r['model']} is {-r['f1_macro_gap_to_best']:.3f} lower on average and better in "
-            f"{r['repeats_beating_best']} of {n_rep} repeats" for r in others))
-
         tune = pd.DataFrame([{**t["params"], "Macro-F1": t["f1_macro"], "Accuracy": t["accuracy"]}
                              for t in M["tuning"]])
         pcols = [c for c in tune.columns if c not in ("Macro-F1", "Accuracy")]
