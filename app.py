@@ -17,6 +17,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.metrics import classification_report, confusion_matrix
 
 from src.explain import fallback_explanation, feature_contributions, predict_frame, run_agent
 from src.pipeline import (COLUMN_DESCRIPTIONS, DROPPED_COLS, INPUT_COLS, LABEL_COL, MODEL_NUMERIC_FEATURES,
@@ -516,6 +517,18 @@ with tab1:
             st.caption("Every training row counts here, so each rare category is judged on all its rows "
                        "(e.g. 14 for Category_4) instead of the 1-2 it has in the 10% test file (Tab 2).")
 
+        imp = (pd.DataFrame(M["column_importance"]["current"]["columns"]).T.reindex(MODEL_COLS)
+               .reset_index(names="column").sort_values("mean"))
+        imp["name"] = imp["column"] + " - " + imp["column"].map(SHORT_NAMES)
+        fig = px.bar(imp, x="mean", y="name", error_x="std", orientation="h", text=imp["mean"].round(3),
+                     title="Column importance (drop in macro-F1 when shuffled)")
+        fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
+        st.plotly_chart(style(fig, 320).update_xaxes(title="macro-F1 drop").update_yaxes(title=""),
+                        width="stretch")
+        st.caption(f"Each column's values are shuffled in turn inside cross-validation; the bar is the average "
+                   f"drop in macro-F1 over {n_rep} repeats, the whisker its spread. A bigger drop means the model "
+                   "leans on that column more.")
+
 
 # =========================================================================== #
 # TAB 2
@@ -601,6 +614,19 @@ with tab2:
         if "Actual" in preds and preds["Actual"].notna().any():
             m = preds["Actual"].notna()
             k[4].metric("Live accuracy vs provided labels", f"{(preds.loc[m, 'Actual'] == preds.loc[m, 'Predicted']).mean():.2%}")
+            y_true, y_pred = preds.loc[m, "Actual"], preds.loc[m, "Predicted"]
+            labels = CLASS_ORDER + sorted(set(y_true) - set(CLASS_ORDER))
+            c1, c2 = st.columns(2)
+            with c1:
+                norm = st.toggle("Show as % of actual class", value=False, key="live_norm")
+                st.plotly_chart(confusion_fig(confusion_matrix(y_true, y_pred, labels=labels), labels, norm,
+                                              f"Confusion matrix on uploaded labels ({int(m.sum()):,} rows)"),
+                                width="stretch")
+            with c2:
+                st.markdown("**Per-class report**")
+                st.dataframe(report_table(classification_report(y_true, y_pred, labels=sorted(set(y_true)),
+                                                                output_dict=True, zero_division=0)),
+                             width="stretch")
 
         f1, f2, f3 = st.columns([2, 1, 1])
         cls_filter = f1.multiselect("Filter predicted class", CLASS_ORDER,
