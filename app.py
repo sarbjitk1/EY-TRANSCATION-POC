@@ -19,10 +19,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.explain import fallback_explanation, feature_contributions, predict_frame, run_agent
-from src.pipeline import (COLUMN_DESCRIPTIONS, INPUT_COLS, LABEL_COL, NUMERIC_FEATURES, coerce_schema,
-                          engineer_features, id_shape, normalize_label, parse_amount)
+from src.pipeline import (COLUMN_DESCRIPTIONS, DROPPED_COLS, INPUT_COLS, LABEL_COL, MODEL_NUMERIC_FEATURES,
+                          base_pipeline, coerce_schema, engineer_features, normalize_label, parse_amount)
 
 ROOT = Path(__file__).parent
+MODEL_COLS = [c for c in INPUT_COLS if c not in DROPPED_COLS]
+SHORT_NAMES = {"Col1": "vendor name", "Col2": "reference ID", "Col3": "amount", "Col4": "line description",
+               "Col5": "posting date", "Col6": "account description", "Col7": "document type"}
+DROPPED_NOTE = ("**The model ignores " + " and ".join(f"{SHORT_NAMES[c]} ({c})" for c in DROPPED_COLS) + ".** "
+                "Almost every reference ID is unique and the posting date only marks the monthly batch, so neither "
+                "tells the model anything about a new transaction. It uses " + ", ".join(SHORT_NAMES[c] for c in MODEL_COLS[:-1])
+                + " and " + SHORT_NAMES[MODEL_COLS[-1]] + ". "
+                "The ignored columns still appear in the Data exploration charts.")
 st.set_page_config(page_title="Transaction Classifier", page_icon="📊", layout="wide")
 
 # Validated categorical order (one fixed hue per class, never cycled) + recessive chart chrome.
@@ -40,8 +48,7 @@ def rgba(hex_color, alpha):
 
 def get_encoder(model):
     """Fitted ColumnTransformer from the model (or the first member of an ensemble)."""
-    pipe = model if hasattr(model, "named_steps") else model.estimators_[0]
-    return pipe.named_steps["prep"].named_steps["encode"]
+    return base_pipeline(model).named_steps["prep"].named_steps["encode"]
 
 
 def style(fig, height=340):
@@ -52,16 +59,41 @@ def style(fig, height=340):
     return fig
 
 
+def fmt_amount(x: float) -> str:
+    for div, unit in [(1e6, "M"), (1e3, "K")]:
+        if abs(x) >= div:
+            return f"{x / div:,.1f}".rstrip("0").rstrip(".") + unit
+    return f"{x:,.0f}"
+
+
+def confusion_fig(cm, labels, norm, title):
+    cm = np.array(cm, dtype=float)
+    present = [i for i in range(len(labels)) if cm[i].sum() > 0 or cm[:, i].sum() > 0]
+    cm, labs = cm[np.ix_(present, present)], [labels[i] for i in present]
+    if norm:
+        cm = cm / cm.sum(1, keepdims=True).clip(min=1)
+    fig = px.imshow(cm, x=labs, y=labs, color_continuous_scale=SEQ, text_auto=".0%" if norm else ".0f",
+                    labels=dict(x="Predicted", y="Actual", color="share" if norm else "rows"), title=title)
+    return style(fig, 440)
+
+
+def report_table(report):
+    rep = pd.DataFrame(report).T
+    rep = rep[rep["support"] > 0].drop(index=["accuracy"], errors="ignore")
+    return rep.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1-score": "{:.3f}", "support": "{:.0f}"})
+
+
 # --------------------------------------------------------------------------- #
 # Loaders
 # --------------------------------------------------------------------------- #
+# The file's modification time is part of the cache key, so a retrain is picked up without restarting.
 @st.cache_resource
-def load_bundle():
+def load_bundle(mtime: float):
     return joblib.load(ROOT / "artifacts" / "model.joblib")
 
 
 @st.cache_data
-def load_metrics():
+def load_metrics(mtime: float):
     return json.loads((ROOT / "artifacts" / "metrics.json").read_text())
 
 
@@ -76,11 +108,52 @@ def load_raw():
     return df, eng
 
 
+@st.cache_data
+def column_association(df: pd.DataFrame, shuffles: int = 5) -> pd.DataFrame:
+    """Strength of relationship between each raw column and the category, plus the value the
+    same measure gives when the categories are shuffled (chance level).
+
+    Text / category columns: Cramér's V from the column x category table. Amount: correlation
+    ratio (eta) on log |amount|, the equivalent 0-1 measure for a number vs a category.
+    Dates are compared by posting month."""
+    y = df["label"].to_numpy()
+    rng = np.random.default_rng(0)
+
+    def cramers_v(x, labels):
+        ct = pd.crosstab(x, labels).to_numpy(dtype=float)
+        n = ct.sum()
+        expected = ct.sum(1, keepdims=True) * ct.sum(0, keepdims=True) / n
+        chi2 = ((ct - expected) ** 2 / expected).sum()
+        return float(np.sqrt(chi2 / n / max(min(ct.shape) - 1, 1)))
+
+    def eta(x, labels):
+        m = x.mean()
+        between = sum((labels == c).sum() * (x[labels == c].mean() - m) ** 2 for c in np.unique(labels))
+        return float(np.sqrt(between / ((x - m) ** 2).sum()))
+
+    keys = {c: df[c].fillna("<missing>").to_numpy() for c in ["Col1", "Col2", "Col4", "Col6", "Col7"]}
+    keys["Col5"] = df["date"].dt.strftime("%Y-%m").fillna("<missing>").to_numpy()
+    amount = np.log10(df["amount"].abs().clip(lower=0.01))
+    ok = amount.notna().to_numpy()
+    rows = []
+    for c in INPUT_COLS:
+        if c == "Col3":
+            x, lab_, f, measure = amount.to_numpy()[ok], y[ok], eta, "correlation ratio"
+        else:
+            x, lab_, f, measure = keys[c], y, cramers_v, "Cramér's V"
+        strength = f(x, lab_)
+        chance = float(np.mean([f(x, rng.permutation(lab_)) for _ in range(shuffles)]))
+        rows.append({"column": c, "measure": measure, "strength": strength, "chance": chance,
+                     "gap": strength - chance})
+    return pd.DataFrame(rows)
+
+
 if not (ROOT / "artifacts" / "model.joblib").exists():
     st.error("No trained model found. Run `.venv/bin/python train.py` first.")
     st.stop()
 
-bundle, M = load_bundle(), load_metrics()
+bundle = load_bundle((ROOT / "artifacts" / "model.joblib").stat().st_mtime)
+M = load_metrics((ROOT / "artifacts" / "metrics.json").stat().st_mtime)
 raw, eng_all = load_raw()
 
 # --------------------------------------------------------------------------- #
@@ -89,8 +162,8 @@ raw, eng_all = load_raw()
 with st.sidebar:
     st.header("Model")
     st.metric("Selected model", M["best_family"])
-    st.metric("Hold-out accuracy", f"{M['holdout']['accuracy']:.1%}")
-    st.metric("Hold-out macro-F1", f"{M['holdout']['f1_macro']:.3f}")
+    st.metric("Cross-validated macro-F1", f"{M['cv_results']['with_cutoff']['f1_macro_mean']:.3f}")
+    st.metric("Cross-validated accuracy", f"{M['cv_results']['with_cutoff']['accuracy_mean']:.1%}")
     st.caption(f"Tuned params: {M['best_params']}")
 
 api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -158,71 +231,60 @@ with tab1:
             fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
             st.plotly_chart(style(fig).update_xaxes(title=""), width="stretch")
 
-        st.subheader("Explore a column against the target")
-        col_pick = st.selectbox("Column", INPUT_COLS + ["Col2 shape (engineered)"],
-                                format_func=lambda c: f"{c} - {COLUMN_DESCRIPTIONS.get(c, 'reference-ID format')}")
-        src = "col2_shape" if col_pick.startswith("Col2 shape") else col_pick
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            if col_pick == "Col3":
-                show = raw.dropna(subset=["amount"]).assign(abs_amount=lambda x: x["amount"].abs().clip(lower=0.01))
-                fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points="outliers",
-                             color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
-                             title="Amount by class (absolute value, log scale)")
-                st.plotly_chart(style(fig, 400).update_layout(showlegend=False).update_xaxes(title=""),
-                                width="stretch")
-            elif col_pick == "Col5":
-                ct = pd.crosstab(raw["date"].dt.to_period("M").astype(str), raw["label"], normalize="index")
-                fig = px.imshow(ct.T.reindex(CLASS_ORDER).fillna(0), color_continuous_scale=SEQ, aspect="auto",
-                                text_auto=".0%", title="Class mix by posting month (share of month)")
-                st.plotly_chart(style(fig, 400), width="stretch")
-            else:
-                topn = st.slider("Top N values", 5, 25, 12)
-                vals = raw[src].fillna("<missing>")
-                top = vals.value_counts().head(topn).index
-                ct = raw.assign(v=vals)[vals.isin(top)].groupby(["v", "label"]).size().reset_index(name="rows")
-                fig = px.bar(ct, y="v", x="rows", color="label", orientation="h", color_discrete_map=CLASS_COLORS,
-                             category_orders={"label": CLASS_ORDER, "v": list(top)},
-                             title=f"Top {topn} values of {src} - stacked by class")
-                fig.update_traces(marker_line_color="white", marker_line_width=1)
-                st.plotly_chart(style(fig, 440).update_yaxes(title=""), width="stretch")
-        with c2:
-            purity = (raw.groupby(src)["label"].agg(lambda s: s.value_counts(normalize=True).iloc[0])
-                      .rename("purity").to_frame().join(raw[src].value_counts().rename("n")))
-            st.metric("Distinct values", f"{raw[src].nunique():,}")
-            st.metric("Missing", int(raw[src].isna().sum()))
-            st.metric("Label purity", f"{(purity['purity'] * purity['n']).sum() / purity['n'].sum():.1%}",
-                      help="How often the most common class for a value is the right answer.")
+        st.subheader("How each column relates to the category")
+        lab = dedup.dropna(subset=["label"])
+        assoc = column_association(lab[INPUT_COLS + ["label", "amount", "date"]])
+        assoc["name"] = assoc["column"] + " - " + assoc["column"].map(SHORT_NAMES) \
+            + np.where(assoc["column"].isin(DROPPED_COLS), " (not used)", "")
+        assoc = assoc.sort_values("gap")
+        long = assoc.melt(["name", "measure"], ["strength", "chance"], var_name="kind", value_name="value")
+        long["kind"] = long["kind"].map({"strength": "Relationship in the data",
+                                         "chance": "Same measure with categories shuffled (pure chance)"})
+        fig = px.bar(long, x="value", y="name", color="kind", barmode="group", orientation="h",
+                     text=long["value"].round(2), hover_data={"measure": True, "name": False},
+                     category_orders={"name": assoc["name"].tolist()[::-1]},
+                     color_discrete_sequence=[PRIMARY, BEFORE],
+                     title="Strength of relationship with the category (0 = none, 1 = the column fixes the category)")
+        fig.update_traces(marker_cornerradius=4, textposition="outside")
+        st.plotly_chart(style(fig, 480).update_xaxes(title="Cramér's V",
+                                                     range=[0, 1.1])
+                        .update_yaxes(title="").update_layout(legend=dict(orientation="h", y=-0.14)),
+                        width="stretch")
 
-        st.subheader("Outliers & correlations")
-        c1, c2 = st.columns(2)
-        with c1:
-            la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
-            q1, q3 = la.quantile([.25, .75])
-            lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
-            fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
-            fig.update_traces(marker_color=PRIMARY)
-            for x in (lo, hi):
-                fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
-            fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
-                             ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
-            st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
-                            width="stretch")
-            m = st.columns(3)
-            m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
-            m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
-            m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
-        with c2:
-            corr = eng_all[NUMERIC_FEATURES].assign(
-                **{f"is_{c}": (raw["label"] == c).astype(float) for c in ["Category_1", "Category_2"]}).corr()
-            fig = px.imshow(corr, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto",
-                            title="Correlation - numeric features vs top classes")
-            st.plotly_chart(style(fig, 470), width="stretch")
+        st.markdown("**Amount by category**")
+        show = lab.dropna(subset=["amount"]).assign(abs_amount=lambda t: t["amount"].abs().clip(lower=0.01))
+        fig = px.box(show, x="label", y="abs_amount", color="label", log_y=True, points=False,
+                     color_discrete_map=CLASS_COLORS, category_orders={"label": CLASS_ORDER},
+                     title="Transaction amount for each category (log scale)")
+        st.plotly_chart(style(fig, 380).update_layout(showlegend=False).update_xaxes(title="")
+                        .update_yaxes(title="amount"), width="stretch")
+        med = show.groupby("label")["abs_amount"].median()
+        st.caption("Each box covers the middle half of that category's amounts; the line inside is the median. "
+                   + ", ".join(f"{c}: {fmt_amount(med[c])}" for c in CLASS_ORDER if c in med)
+                   + " (medians). Category_2 transactions tend to be smaller and Category_4 much larger, which is "
+                   "why amount helps the model even though its overall relationship score is modest.")
+
+        st.subheader("Outliers")
+        la = np.log10(raw["amount"].abs().clip(lower=0.01)).dropna()
+        q1, q3 = la.quantile([.25, .75])
+        lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+        fig = px.histogram(la, nbins=60, title="Amount distribution with IQR outlier fences")
+        fig.update_traces(marker_color=PRIMARY)
+        for x in (lo, hi):
+            fig.add_vline(x=x, line_dash="dash", line_color="#e34948")
+        fig.update_xaxes(title="log10 |amount|", tickvals=list(range(-2, 8)),
+                         ticktext=["0.01", "0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M"])
+        st.plotly_chart(style(fig, 360).update_layout(showlegend=False).update_yaxes(title="rows"),
+                        width="stretch")
+        m = st.columns(3)
+        m[0].metric("Outliers (IQR)", int(((la < lo) | (la > hi)).sum()))
+        m[1].metric("Negative amounts", int((raw["amount"] < 0).sum()))
+        m[2].metric("Largest amount", f"{raw['amount'].abs().max():,.0f}")
 
     # ------------------------------------------------------------------ Cleaning & preprocessing
     with prep:
-        STEPS = ["Labels", "Duplicates", "Amount", "Date", "Reference ID", "Missing values",
-                 "Scaling", "Final features"]
+        st.info(DROPPED_NOTE, icon="ℹ️")
+        STEPS = ["Labels", "Duplicates", "Amount", "Missing values", "Scaling"]
         step = st.segmented_control("Pipeline step", [f"{i + 1}. {s}" for i, s in enumerate(STEPS)],
                                     default="1. Labels", key="prep_step") or "1. Labels"
         step = step.split(". ", 1)[1]
@@ -284,43 +346,10 @@ with tab1:
             c2.plotly_chart(style(fig.update_traces(marker_color=PRIMARY)).update_layout(showlegend=False)
                             .update_xaxes(title="signed log amount").update_yaxes(title="rows"), width="stretch")
 
-        elif step == "Date":
-            fmt = raw["Col5"].dropna().map(id_shape)
-            k = st.columns(3)
-            k[0].metric("Date formats found", fmt.nunique())
-            k[1].metric("Unparseable dates", int(raw["date"].isna().sum() - raw["Col5"].isna().sum()))
-            k[2].metric("Features created", 4)
-            ex = raw.dropna(subset=["Col5"]).groupby(fmt).head(2).head(8)
-            st.dataframe(pd.DataFrame({"Before: raw text": ex["Col5"], "Parsed date": ex["date"].dt.date,
-                                       **{c: eng_all.loc[ex.index, c] for c in
-                                          ["month", "day", "is_month_start", "is_month_end"]}}),
-                         hide_index=True, width="stretch")
-            by_m = eng_all["month"].value_counts().sort_index().reset_index()
-            by_m.columns = ["month", "rows"]
-            fig = px.bar(by_m, x="month", y="rows", text="rows", title="After: rows per posting month")
-            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4, textposition="outside")
-            st.plotly_chart(style(fig, 320).update_xaxes(dtick=1), width="stretch")
-
-        elif step == "Reference ID":
-            k = st.columns(2)
-            k[0].metric("Before: distinct IDs", f"{raw['Col2'].nunique():,}")
-            k[1].metric("After: distinct ID shapes", f"{raw['col2_shape'].nunique():,}")
-            c1, c2 = st.columns(2)
-            with c1:
-                top = raw["col2_shape"].value_counts().head(12)
-                ex = raw.groupby("col2_shape")["Col2"].first().reindex(top.index)
-                st.dataframe(pd.DataFrame({"Before: example ID": ex.values, "After: shape": top.index,
-                                           "Rows": top.values}), hide_index=True, width="stretch", height=420)
-            with c2:
-                fig = px.bar(top.iloc[::-1].reset_index(), x="count", y="col2_shape", orientation="h", text="count",
-                             title="Most common ID shapes")
-                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
-                st.plotly_chart(style(fig, 420).update_yaxes(title="").update_xaxes(title="rows"), width="stretch")
-
         elif step == "Missing values":
             c1, c2 = st.columns([3, 2])
             with c1:
-                mv = pd.DataFrame({"column": INPUT_COLS, "Before": raw[INPUT_COLS].isna().sum().values,
+                mv = pd.DataFrame({"column": MODEL_COLS, "Before": raw[MODEL_COLS].isna().sum().values,
                                    "After": 0}).melt("column", var_name="stage", value_name="missing")
                 fig = px.bar(mv, x="column", y="missing", color="stage", barmode="group", text="missing",
                              color_discrete_map={"Before": BEFORE, "After": PRIMARY},
@@ -330,19 +359,17 @@ with tab1:
             with c2:
                 st.dataframe(pd.DataFrame([
                     ["Col1, Col4, Col6", "Empty text"],
-                    ["Col2", "'<missing>' shape"],
                     ["Col3", "Median (from training data)"],
-                    ["Col5", "Median month / day (from training data)"],
                     ["Col7", "'<missing>' category"],
                     ["Col4", "+ flag: col4_missing"],
                 ], columns=["Column", "Filled with"]), hide_index=True, width="stretch")
 
-        elif step == "Scaling":
+        else:  # Scaling
             num = encoder.named_transformers_["numeric"]
-            feat = st.selectbox("Numeric feature", NUMERIC_FEATURES)
-            imputed = num.named_steps["impute"].transform(eng_all[NUMERIC_FEATURES])
-            scaled = pd.DataFrame(num.named_steps["scale"].transform(imputed), columns=NUMERIC_FEATURES)
-            before = pd.Series(imputed[:, NUMERIC_FEATURES.index(feat)])
+            feat = st.selectbox("Numeric feature", MODEL_NUMERIC_FEATURES)
+            imputed = num.named_steps["impute"].transform(eng_all[MODEL_NUMERIC_FEATURES])
+            scaled = pd.DataFrame(num.named_steps["scale"].transform(imputed), columns=MODEL_NUMERIC_FEATURES)
+            before = pd.Series(imputed[:, MODEL_NUMERIC_FEATURES.index(feat)])
             c1, c2 = st.columns(2)
             for col, s, name, color in [(c1, before, "Before", BEFORE), (c2, scaled[feat], "After", PRIMARY)]:
                 fig = px.histogram(s, nbins=50, title=f"{name}: {feat}")
@@ -353,23 +380,6 @@ with tab1:
                 m[0].metric("Mean", f"{s.mean():.2f}")
                 m[1].metric("Std", f"{s.std(ddof=0):.2f}")
 
-        else:  # Final features
-            c1, c2 = st.columns([2, 3])
-            with c1:
-                dims = pd.Series(M["feature_dims"]).rename(lambda b: b.replace("_tfidf", " text").capitalize()) \
-                    .rename_axis("block").reset_index(name="features")
-                fig = px.bar(dims, x="features", y="block", orientation="h", text="features",
-                             title=f"7 raw columns → {dims['features'].sum():,} model features")
-                fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
-                st.plotly_chart(style(fig, 360).update_yaxes(title=""), width="stretch")
-            with c2:
-                i = st.number_input("Trace one transaction - row", 0, len(raw) - 1, 0, step=1)
-                a, b = st.columns(2)
-                a.markdown("**Before: raw**")
-                a.dataframe(raw.loc[i, INPUT_COLS + ["label"]].astype(str).rename("value").to_frame(),
-                            width="stretch", height=300)
-                b.markdown("**After: engineered**")
-                b.dataframe(eng_all.loc[i].astype(str).rename("value").to_frame(), width="stretch", height=300)
 
     # ------------------------------------------------------------------ Split
     with split:
@@ -416,8 +426,15 @@ with tab1:
 
     # ------------------------------------------------------------------ Model results
     with results:
+        st.info(DROPPED_NOTE, icon="ℹ️")
+        CV = M["cv_results"]
+        n_rep = CV["n_repeats"]
         METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy",
                    "f1_weighted": "Weighted F1"}
+        st.caption(f"**How we test.** Every score below comes from 5-fold cross-validation, repeated {n_rep} times "
+                   f"with different shuffles: each training row is predicted by a model that never saw it, and "
+                   f"each repeat is scored once over all rows. Macro-F1 is the average F1 over the categories "
+                   f"present, so each category counts equally no matter how rare it is.")
         metric = st.segmented_control("Metric", list(METRICS), format_func=METRICS.get, default="f1_macro",
                                       key="cv_metric") or "f1_macro"
         c1, c2 = st.columns(2)
@@ -427,20 +444,24 @@ with tab1:
             fig = px.bar(cv, x="model", y=f"{metric}_mean", error_y=f"{metric}_std", color="selected",
                          text=cv[f"{metric}_mean"].round(3), hover_data={"fit_seconds": True},
                          color_discrete_map={"Selected": PRIMARY, "Other": BEFORE},
-                         title=f"Algorithms compared - 5-fold CV {METRICS[metric]}")
+                         title=f"Algorithms compared - {METRICS[metric]}, average of {n_rep} repeats")
             fig.update_traces(marker_cornerradius=4, textposition="inside")
             st.plotly_chart(style(fig, 380).update_layout(showlegend=False).update_xaxes(title="")
                             .update_yaxes(title=METRICS[metric]), width="stretch")
         with c2:
-            folds = pd.DataFrame([{"model": r["model"], "fold": i + 1, "score": s}
-                                  for r in M["cv_comparison"] for i, s in enumerate(r[f"{metric}_folds"])])
-            fig = px.strip(folds, x="model", y="score", hover_data=["fold"], title="Score on each CV fold")
-            fig.update_traces(marker=dict(size=11, color=PRIMARY, line=dict(width=2, color="white")))
+            folds = pd.DataFrame([{"model": r["model"], "repeat": i + 1, "score": s}
+                                  for r in M["cv_comparison"] for i, s in enumerate(r[f"{metric}_repeats"])])
+            fig = px.strip(folds, x="model", y="score", hover_data=["repeat"], title="Score on each repeat")
+            fig.update_traces(marker=dict(size=9, color=PRIMARY, line=dict(width=1.5, color="white")))
             means = folds.groupby("model")["score"].mean()
             fig.add_trace(go.Scatter(x=means.index, y=means.values, mode="markers", name="mean",
                                      marker=dict(symbol="line-ew-open", size=40, color="#0b0b0b", line_width=2)))
             st.plotly_chart(style(fig, 380).update_xaxes(title="").update_yaxes(title=METRICS[metric]),
                             width="stretch")
+        others = [r for r in M["cv_comparison"] if r["model"] != M["best_family"]]
+        st.caption("**Repeat-by-repeat against " + M["best_family"] + " (macro-F1, same splits):** " + " · ".join(
+            f"{r['model']} is {-r['f1_macro_gap_to_best']:.3f} lower on average and better in "
+            f"{r['repeats_beating_best']} of {n_rep} repeats" for r in others))
 
         tune = pd.DataFrame([{**t["params"], "Macro-F1": t["f1_macro"], "Accuracy": t["accuracy"]}
                              for t in M["tuning"]])
@@ -462,42 +483,26 @@ with tab1:
         with c2:
             st.metric("Selected model", M["best_family"])
             st.metric("Best parameters", ", ".join(f"{k.split('__')[-1]} = {v}" for k, v in M["best_params"].items()))
-            st.metric("Tuning search", f"{len(tune)} settings × 5 folds")
+            st.metric("Tuning search", f"{len(tune)} settings × {n_rep} repeats")
 
-        st.subheader("Hold-out test results")
-        H = M["holdout"]
-        k = st.columns(4)
-        k[0].metric("Accuracy", f"{H['accuracy']:.2%}",
-                    delta=f"{(H['accuracy'] - H['majority_baseline_accuracy']) * 100:+.1f} pts vs baseline")
-        k[1].metric("Macro-F1", f"{H['f1_macro']:.3f}")
-        k[2].metric("Balanced accuracy", f"{H['balanced_accuracy']:.3f}")
-        k[3].metric("Weighted F1", f"{H['f1_weighted']:.3f}")
-
+        # ---------------------------------------------------------------- main results
+        st.subheader("Results on all training rows")
+        W = CV["with_cutoff"]
+        k = st.columns(3)
+        k[0].metric("Macro-F1", f"{W['f1_macro_mean']:.3f} ± {W['f1_macro_std']:.3f}")
+        k[1].metric("Accuracy", f"{W['accuracy_mean']:.2%}")
+        k[2].metric("Balanced accuracy", f"{W['balanced_accuracy']:.3f}")
         c1, c2 = st.columns(2)
         with c1:
-            norm = st.toggle("Show as % of actual class", value=False)
-            cm = np.array(H["confusion_matrix"], dtype=float)
-            present = [i for i, l in enumerate(H["labels"]) if cm[i].sum() > 0 or cm[:, i].sum() > 0]
-            cm = cm[np.ix_(present, present)]
-            labs = [H["labels"][i] for i in present]
-            if norm:
-                cm = cm / cm.sum(1, keepdims=True).clip(min=1)
-            fig = px.imshow(cm, x=labs, y=labs, color_continuous_scale=SEQ, text_auto=".0%" if norm else "d",
-                            labels=dict(x="Predicted", y="Actual", color="share" if norm else "rows"),
-                            title="Confusion matrix")
-            st.plotly_chart(style(fig, 440), width="stretch")
+            norm = st.toggle("Show as % of actual class", value=False, key="cv_norm")
+            st.plotly_chart(confusion_fig(W["confusion_matrix"], W["labels"], norm,
+                                          "Confusion matrix (average per repeat)"), width="stretch")
         with c2:
-            rep = pd.DataFrame(H["report"]).T
-            rep = rep[rep["support"] > 0].drop(index=["accuracy"], errors="ignore")
-            st.markdown("**Classification report**")
-            st.dataframe(rep.style.format({"precision": "{:.3f}", "recall": "{:.3f}", "f1-score": "{:.3f}",
-                                           "support": "{:.0f}"}), width="stretch")
-            imp = pd.DataFrame(M["column_importance"]).T.reset_index(names="column").sort_values("mean")
-            fig = px.bar(imp, x="mean", y="column", error_x="std", orientation="h",
-                         title="Column importance (drop in macro-F1 when shuffled)")
-            fig.update_traces(marker_color=PRIMARY, marker_cornerradius=4)
-            st.plotly_chart(style(fig, 300).update_xaxes(title="macro-F1 drop").update_yaxes(title=""),
-                            width="stretch")
+            st.markdown("**Per-category results**")
+            st.dataframe(report_table(W["report"]), width="stretch")
+            st.caption("Every training row counts here, so each rare category is judged on all its rows "
+                       "(e.g. 14 for Category_4) instead of the 1-2 it has in the 10% test file (Tab 2).")
+
 
 # =========================================================================== #
 # TAB 2
@@ -573,24 +578,30 @@ with tab2:
 
     preds = st.session_state.get("preds")
     if up is not None and preds is not None:
-        k = st.columns(4)
+        k = st.columns(5)
         k[0].metric("Rows scored", f"{len(preds):,}")
         k[1].metric("Pipeline time", f"{st.session_state['elapsed']:.2f}s")
         k[2].metric("Low-confidence rows (<70%)", int((preds["Confidence"] < 0.7).sum()))
+        k[3].metric("Rows from unknown vendors", int((~preds["Known vendor"]).sum()),
+                    help="Vendor (Col1) never seen in training. The model is much less reliable on these - "
+                         "review them by hand.")
         if "Actual" in preds and preds["Actual"].notna().any():
             m = preds["Actual"].notna()
-            k[3].metric("Live accuracy vs provided labels", f"{(preds.loc[m, 'Actual'] == preds.loc[m, 'Predicted']).mean():.2%}")
+            k[4].metric("Live accuracy vs provided labels", f"{(preds.loc[m, 'Actual'] == preds.loc[m, 'Predicted']).mean():.2%}")
 
-        f1, f2 = st.columns([2, 1])
+        f1, f2, f3 = st.columns([2, 1, 1])
         cls_filter = f1.multiselect("Filter predicted class", CLASS_ORDER,
                                     default=[c for c in CLASS_ORDER if c in set(preds["Predicted"])])
         only_low = f2.toggle("Only low-confidence rows")
+        only_new = f3.toggle("Only unknown vendors")
         view = preds[preds["Predicted"].isin(cls_filter)]
         if only_low:
             view = view[view["Confidence"] < 0.7]
+        if only_new:
+            view = view[~view["Known vendor"]]
 
         st.markdown("**Predictions** - click a row, then press **Explain** (≈25 rows visible, scroll for more)")
-        show_cols = ["Predicted", "Confidence"] + (["Actual"] if "Actual" in view else []) + INPUT_COLS
+        show_cols = ["Predicted", "Confidence", "Known vendor"] + (["Actual"] if "Actual" in view else []) + INPUT_COLS
         event = st.dataframe(
             view[show_cols], height=920, width="stretch", on_select="rerun",
             selection_mode="single-row", key="pred_table",

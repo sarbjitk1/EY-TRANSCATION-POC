@@ -12,6 +12,7 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
@@ -35,6 +36,13 @@ NUMERIC_FEATURES = [
     "col2_len", "col2_digit_frac", "col2_has_sep", "col2_sci_notation",
     "col1_ntok", "col4_ntok", "col6_ntok", "col4_missing",
 ]
+
+# Col2 (reference ID) and Col5 (posting date) are still engineered above for the
+# EDA charts, but the model ignores them: dropping them left CV scores unchanged.
+DROPPED_COLS = ["Col2", "Col5"]
+MODEL_CATEGORICAL = ["col7"]
+MODEL_NUMERIC_FEATURES = [f for f in NUMERIC_FEATURES
+                          if not f.startswith("col2_") and f not in ("month", "day", "is_month_start", "is_month_end")]
 
 
 # --------------------------------------------------------------------------- #
@@ -172,19 +180,22 @@ def _tfidf(ngram_max: int, max_features: int | None) -> TfidfVectorizer:
                            max_features=max_features, sublinear_tf=True)
 
 
-def build_preprocessor(ngram_max: int = 2, max_features: int | None = None) -> Pipeline:
+def build_preprocessor(ngram_max: int = 2, max_features: int | None = None, all_columns: bool = False) -> Pipeline:
     """Linear models get uni+bigrams over the full vocabulary; tree models get a
     compact unigram vocabulary (trees split one feature at a time, so bigrams add
-    little and a dense 10k-wide matrix would make boosting slow)."""
+    little and a dense 10k-wide matrix would make boosting slow).
+    all_columns=True also uses the Col2 / Col5 features (for comparison only)."""
+    categorical = ["col2_shape", "col7"] if all_columns else MODEL_CATEGORICAL
+    numeric = NUMERIC_FEATURES if all_columns else MODEL_NUMERIC_FEATURES
     encode = ColumnTransformer(
         transformers=[
             ("col1_tfidf", _tfidf(ngram_max, max_features), "Col1_text"),
             ("col4_tfidf", _tfidf(ngram_max, max_features), "Col4_text"),
             ("col6_tfidf", _tfidf(ngram_max, max_features), "Col6_text"),
             ("categorical", OneHotEncoder(handle_unknown="ignore", min_frequency=2),
-             ["col2_shape", "col7"]),
+             categorical),
             ("numeric", Pipeline([("impute", SimpleImputer(strategy="median")),
-                                  ("scale", StandardScaler())]), NUMERIC_FEATURES),
+                                  ("scale", StandardScaler())]), numeric),
         ],
         sparse_threshold=1.0,
     )
@@ -200,3 +211,51 @@ def to_dense(X):
 
 def densify() -> FunctionTransformer:
     return FunctionTransformer(to_dense, accept_sparse=True, validate=False)
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation + decision rule shared by training, dashboard and explainer
+# --------------------------------------------------------------------------- #
+def macro_f1(y_true, y_pred) -> float:
+    """Macro-F1 over the classes that actually occur in y_true. One definition
+    everywhere, so a class with no rows in an evaluation set (e.g. Category_5 in
+    the hold-out) is never silently counted as a zero."""
+    return f1_score(y_true, y_pred, labels=sorted(set(y_true)), average="macro", zero_division=0)
+
+
+def thresholded_predict(proba: np.ndarray, classes, min_proba: dict | None) -> np.ndarray:
+    """Argmax, except a class listed in min_proba is only chosen when its
+    probability reaches that cut-off; otherwise the next most likely class wins."""
+    P = np.asarray(proba, dtype=float).copy()
+    classes = np.asarray(classes)
+    for c, t in (min_proba or {}).items():
+        i = np.flatnonzero(classes == c)
+        if i.size:
+            P[P[:, i[0]] < t, i[0]] = -1.0
+    return classes[P.argmax(1)]
+
+
+class ThresholdedClassifier:
+    """A fitted model plus per-class probability cut-offs (see thresholded_predict).
+    Probabilities are untouched; only the final class decision changes."""
+
+    def __init__(self, model, min_proba: dict):
+        self.model, self.min_proba = model, dict(min_proba)
+        self.classes_ = model.classes_
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+    def predict(self, X):
+        return thresholded_predict(self.predict_proba(X), self.classes_, self.min_proba)
+
+
+def base_pipeline(model) -> Pipeline:
+    """The fitted prep+classifier Pipeline inside a (possibly thresholded / ensembled) model.
+    Checks attributes, not classes: Streamlit re-imports this module on edits, and a model
+    loaded before that is an instance of the *old* class objects, so isinstance() fails."""
+    if hasattr(model, "min_proba"):          # ThresholdedClassifier
+        model = model.model
+    if hasattr(model, "named_steps"):        # Pipeline
+        return model
+    return model.estimators_[0]              # VotingClassifier
