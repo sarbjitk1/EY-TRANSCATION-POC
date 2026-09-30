@@ -488,7 +488,8 @@ with tab1:
                 fig = px.line(tl, x=p, y="score", color="metric", markers=True, log_x=True,
                               color_discrete_map={"Macro-F1": PRIMARY, "Accuracy": CLASS_COLORS["Category_2"]},
                               title=f"Hyper-parameter tuning - {M['best_family']} ({p.split('__')[-1]})")
-                fig.add_vline(x=float(M["best_params"][p]), line_dash="dash", line_color="#6b7280",
+                # shapes on a log axis take log10 positions, so x=10 would land at 1e10
+                fig.add_vline(x=np.log10(float(M["best_params"][p])), line_dash="dash", line_color="#6b7280",
                               annotation_text="selected")
                 st.plotly_chart(style(fig, 320).update_xaxes(title=p.split("__")[-1]), width="stretch")
             else:
