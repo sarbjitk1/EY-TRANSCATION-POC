@@ -629,12 +629,27 @@ with tab2:
             #                                                     output_dict=True, zero_division=0)),
             #                  width="stretch")
 
-        f1, f2, f3 = st.columns([2, 1, 1])
-        cls_filter = f1.multiselect("Filter predicted class", CLASS_ORDER,
-                                    default=[c for c in CLASS_ORDER if c in set(preds["Predicted"])])
-        only_low = f2.toggle("Only low-confidence rows")
-        only_new = f3.toggle("Only unknown vendors")
-        view = preds[preds["Predicted"].isin(cls_filter)]
+        has_actual = "Actual" in preds
+        cols = st.columns([3, 3, 2, 2] if has_actual else [3, 2, 2])
+        f_pred, f_toggles = cols[0], cols[-2:]
+        # All categories, even ones absent from this file (e.g. Category_5), plus any unexpected labels.
+        present = lambda s: CLASS_ORDER + sorted(set(s.dropna()) - set(CLASS_ORDER))
+        # Empty = no filter. With both set, a row is kept if EITHER its predicted or its actual category matches.
+        cls_filter = f_pred.multiselect("Predicted category", present(preds["Predicted"]), key="flt_pred",
+                                        placeholder="All")
+        act_filter = []
+        if has_actual:
+            act_opts = present(preds["Actual"]) + (["(no label)"] if preds["Actual"].isna().any() else [])
+            act_filter = cols[1].multiselect("Actual category", act_opts, key="flt_act", placeholder="All",
+                                             help="Rows matching the predicted OR the actual selection are shown.")
+        keep = pd.Series(not (cls_filter or act_filter), index=preds.index)
+        if cls_filter:
+            keep |= preds["Predicted"].isin(cls_filter)
+        if act_filter:
+            keep |= preds["Actual"].isin(act_filter) | (preds["Actual"].isna() & ("(no label)" in act_filter))
+        view = preds[keep]
+        only_low = f_toggles[0].toggle("Only low-confidence rows")
+        only_new = f_toggles[1].toggle("Only unknown vendors")
         if only_low:
             view = view[view["Confidence"] < 0.7]
         if only_new:
