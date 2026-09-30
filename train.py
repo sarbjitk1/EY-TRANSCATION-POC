@@ -22,7 +22,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LogisticRegression
 from sklearn.base import clone
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score, classification_report,
-                             confusion_matrix, f1_score)
+                             confusion_matrix)
 from sklearn.model_selection import (ParameterGrid, StratifiedGroupKFold, StratifiedKFold, cross_val_predict,
                                      train_test_split)
 from sklearn.pipeline import Pipeline
@@ -101,8 +101,7 @@ def oof_scores(model, X, y) -> dict:
         pred = cross_val_predict(clone(model), X, y, cv=StratifiedKFold(5, shuffle=True, random_state=SEED + r),
                                  n_jobs=-1)
         for k, v in {"accuracy": accuracy_score(y, pred), "f1_macro": macro_f1(y, pred),
-                     "balanced_accuracy": balanced_accuracy_score(y, pred),
-                     "f1_weighted": f1_score(y, pred, average="weighted")}.items():
+                     "balanced_accuracy": balanced_accuracy_score(y, pred)}.items():
             out.setdefault(f"{k}_repeats", []).append(float(v))
     for k in list(out):
         m = k.removesuffix("_repeats")
@@ -265,7 +264,6 @@ def main():
     holdout = {
         "accuracy": accuracy_score(y_te, pred),
         "f1_macro": macro_f1(y_te, pred),
-        "f1_weighted": f1_score(y_te, pred, average="weighted"),
         "balanced_accuracy": balanced_accuracy_score(y_te, pred),
         "labels": classes,
         "confusion_matrix": confusion_matrix(y_te, pred, labels=classes).tolist(),

@@ -451,8 +451,7 @@ with tab1:
     with results:
         CV = M["cv_results"]
         n_rep = CV["n_repeats"]
-        METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy",
-                   "f1_weighted": "Weighted F1"}
+        METRICS = {"f1_macro": "Macro-F1", "accuracy": "Accuracy", "balanced_accuracy": "Balanced accuracy"}
         metric = st.segmented_control("Metric", list(METRICS), format_func=METRICS.get, default="f1_macro",
                                       key="cv_metric") or "f1_macro"
         c1, c2 = st.columns(2)
